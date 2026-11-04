@@ -3,6 +3,7 @@ from dataclasses import dataclass
 
 import numpy as np
 import numpy.typing as npt
+import pandas as pd
 import streamlit as st
 from map_plots import build_scene_map_figure
 from plots import (
@@ -248,7 +249,7 @@ def _comparison_table(
             }
         )
     st.subheader("All methods on the same channel and noise")
-    st.dataframe(rows, hide_index=True, width="stretch")
+    st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
 
 
 def render_link_tab(resources: AppResources, controls: Controls) -> None:

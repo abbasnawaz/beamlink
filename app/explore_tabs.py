@@ -1,6 +1,7 @@
 from dataclasses import replace
 
 import numpy as np
+import pandas as pd
 import streamlit as st
 from link_tab import MODULATION_LABELS, AppResources, Controls, available_methods, selected_position, simulate
 from map_plots import build_coverage_figure, categorical_colorscale
@@ -161,9 +162,8 @@ def render_about_tab(resources: AppResources) -> None:
             f"{predictor.norm.n_beams} beams. Evaluated on spatially held-out test blocks."
         )
         card = resources.model_card(top_k)
-        st.dataframe(
-            [{"Metric": name, "Value": round(value, 3)} for name, value in card.items()], hide_index=True
-        )
+        table = pd.DataFrame({"Metric": list(card), "Value": [round(value, 3) for value in card.values()]})
+        st.dataframe(table, hide_index=True)
     st.subheader("Limitations")
     st.markdown(
         "- Static channel within a slot, single user, single BS.\n"
