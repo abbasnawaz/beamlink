@@ -1,0 +1,47 @@
+carrier_frequency_hz: 28.0e+9
+subcarrier_spacing_hz: 120.0e+3
+n_subcarriers: 256
+n_ofdm_symbols: 14
+cyclic_prefix_length: 18
+pilot_symbol_indices: [0]
+pilot_spacing: 4
+pilot_offset: 0
+pilot_seed: 1234
+
+n_antennas: 8
+antenna_spacing_wavelengths: 0.5
+bs_boresight_azimuth: 1.5707963267948966
+codebook_oversampling: 1
+codebook_sector: null
+
+n_cir_precursor_taps: 4
+n_cir_postcursor_taps: 4
+equalizer: mmse
+
+tx_power_dbm: 30.0
+noise_figure_db: 7.0
+
+scene_name: simple_street_canyon
+bs_position_xy_m: [0.0, -7.6]
+bs_height_m: 12.0
+ue_height_m: 1.5
+ue_grid_extent_m: [-90.0, 90.0, -58.0, 58.0]
+grid_spacing_m: 1.5
+building_clearance_m: 1.0
+max_paths: 48
+max_reflection_depth: 4
+rt_samples_per_source: 1000000
+rt_diffraction: true
+rt_receivers_per_batch: 1
+label_antenna_counts: [8, 16]
+
+split_block_m: 15.0
+split_fractions: [0.7, 0.15, 0.15]
+predictor_feature_set: position
+predictor_hidden_units: 128
+predictor_hidden_layers: 3
+predictor_epochs: 150
+predictor_batch_size: 256
+predictor_learning_rate: 1.0e-3
+soft_label_temperature_db: 1.0
+predictor_top_k: 3
