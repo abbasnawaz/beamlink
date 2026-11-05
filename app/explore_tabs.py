@@ -29,27 +29,6 @@ COVERAGE_VIEWS = (
 )
 SNR_VIEWS = COVERAGE_VIEWS[:2]
 NO_SERVICE_LABEL = f"No service (SNR < {MIN_SERVICE_SNR_DB:.0f} dB)"
-WHY_FOUR_SECTORS = """
-The first version used one ULA with isotropic elements, with its axis along the street. A ULA only sees the
-phase step between neighbouring elements, which depends only on the angle to its axis, so two directions that
-are mirror images about the axis look identical. Along the axis (end-fire), with half-wavelength spacing, the
-phase step is +pi one way and -pi the other, which is the same thing: a beam aimed down the street at +x also
-fires down -x. Most users sit along the street, so the old array wasted much of its energy.
-
-Real base stations use directional elements and sectors, and so does this one: four panels facing the four
-street directions, tilted 10 deg down, each with TR 38.901 elements (8 dBi, 65 deg beamwidth, 30 dB
-front-to-back). Each panel only hears its own half-plane, so the mirror ambiguity no longer matters.
-
-| N = 8, 30 dBm | v1: single ULA | v2: four sectors |
-|---|---|---|
-| Median SNR, LOS / NLOS | 37.2 / 12.0 dB | 43.7 / 17.9 dB |
-| Positions without service | 23.5% | 19.7% |
-| Positions whose best beam is the most-used beam | 36.6% (beam 0) | 7.8% |
-| Sweep gain at (30, 0), against nominal | 7.4 of 9.0 dB | 17.8 of 17.0 dB |
-| AI: beams measured, top-K accuracy | 3 / 8, 97.6% | 10 / 64, 97.6% |
-
-Only 0.3% of positions lose more than 1 dB: users right under the mast, who still have about 43 dB.
-"""
 PIPELINE_DOT = """
 digraph pipeline {
   rankdir=LR;
@@ -224,13 +203,3 @@ def render_about_tab(resources: AppResources) -> None:
         card = resources.model_card(top_k)
         table = pd.DataFrame({"Metric": list(card), "Value": [round(value, 3) for value in card.values()]})
         st.dataframe(table, hide_index=True)
-    st.subheader("Why four sectors")
-    st.markdown(WHY_FOUR_SECTORS)
-    st.subheader("Limitations")
-    st.markdown(
-        "- Static channel within a slot, single user, single BS.\n"
-        "- One ray-traced scene, so the model has learned this street and not streets in general.\n"
-        "- Scalar TR 38.901 pattern (the polarization rotation of a tilted panel is ignored), vertical "
-        "polarisation, and no measurement noise in the beam sweep.\n"
-        "- Free Streamlit apps sleep when idle; the first load after a pause takes a few seconds."
-    )
