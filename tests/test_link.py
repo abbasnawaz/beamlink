@@ -18,10 +18,11 @@ from beamlink.config import (
     SimulationMode,
     SystemConfig,
     load_config,
+    single_isotropic_panel,
 )
 from beamlink.data import ChannelPaths, load_dataset, position_paths, synthetic_paths
 from beamlink.exceptions import ConfigError, ShapeError
-from beamlink.link import LinkResult, run_link
+from beamlink.link import LinkResult, array_beam_pattern, run_link
 from beamlink.linkbudget import (
     db_to_linear,
     dbm_to_watt,
@@ -51,10 +52,29 @@ POWER_STEP_DB = 10.0
 SNR_TOLERANCE_DB = 1e-3
 N_DATASET_POSITIONS = 4
 DEFAULT_NOISE_FLOOR_DBM = -92.126
+SECTOR_GAIN_TOLERANCE_DB = 1.0
+ORDERING_TOLERANCE_DB = 1e-4
+N_ORDERING_CHANNELS = 12
+N_AI_CANDIDATES = 3
+FULL_AZIMUTH_SPAN = (-np.pi, np.pi)
 
 
 def _config(**changes: object) -> SystemConfig:
     return replace(load_config(CONFIG_PATH), **changes)
+
+
+def _isotropic_config() -> SystemConfig:
+    return single_isotropic_panel(_config(n_antennas=1))
+
+
+def _single_path_at(azimuth: float, zenith: float = np.pi / 2) -> ChannelPaths:
+    return ChannelPaths(
+        path_gain=np.ones(1, dtype=np.complex64),
+        path_delay_s=np.zeros(1, dtype=np.float32),
+        path_azimuth=np.full(1, azimuth, dtype=np.float32),
+        path_zenith=np.full(1, zenith, dtype=np.float32),
+        path_valid=np.ones(1, dtype=bool),
+    )
 
 
 def _awgn_paths() -> ChannelPaths:
@@ -67,14 +87,19 @@ def _awgn_paths() -> ChannelPaths:
     )
 
 
-def _multipath(seed: int, max_delay_s: float, delay_decay_s: float) -> ChannelPaths:
+def _multipath(
+    seed: int,
+    max_delay_s: float,
+    delay_decay_s: float,
+    azimuth_span: tuple[float, float] = SYNTHETIC_AZIMUTH_SPAN,
+) -> ChannelPaths:
     paths = synthetic_paths(
         rng=np.random.default_rng(seed),
         n_positions=1,
         n_paths=N_PATHS,
         max_delay_s=max_delay_s,
         delay_decay_s=delay_decay_s,
-        azimuth_span=SYNTHETIC_AZIMUTH_SPAN,
+        azimuth_span=azimuth_span,
         zenith_spread=SYNTHETIC_ZENITH_SPREAD,
         los_power_ratio=None,
     )
@@ -115,7 +140,7 @@ def _ber_sigma(probability: float, n_bits: int) -> float:
 
 
 def test_awgn_ber_matches_theory() -> None:
-    config = _config(n_antennas=1)
+    config = _isotropic_config()
     for modulation, snr_db in (
         (Modulation.QPSK, 2.0),
         (Modulation.QPSK, 6.0),
@@ -174,7 +199,7 @@ def test_methods_see_the_same_bits_and_noise() -> None:
     paths = _multipath(4, LONG_DELAY_SPREAD_S, SYNTHETIC_DELAY_DECAY_S)
     config = _config()
     sweep = _run(paths, config, csi_mode=CsiMode.LS, seed=5)
-    candidates = np.array([sweep.beam_idx, (sweep.beam_idx + 1) % config.n_antennas], dtype=np.int64)
+    candidates = np.array([sweep.beam_idx, (sweep.beam_idx + 1) % config.n_beams], dtype=np.int64)
     top_k = _run(
         paths, config, method=BeamMethod.AI_TOP_K, csi_mode=CsiMode.LS, seed=5, candidate_beams=candidates
     )
@@ -246,7 +271,7 @@ def test_dbm_and_watt_conversions_round_trip() -> None:
 
 
 def test_tx_power_mode_snr_follows_the_link_budget() -> None:
-    config = _config(n_antennas=1)
+    config = _isotropic_config()
     result = _run(_single_path(PATH_GAIN_DB), config, snr_db=None, tx_power_dbm=TX_POWER_DBM)
     noise_dbm = float(
         watt_to_dbm(
@@ -295,4 +320,52 @@ def test_run_link_on_ray_traced_positions_meets_the_latency_budget() -> None:
             )
             assert time.perf_counter() - start_s < RUN_LINK_BUDGET_S
             assert np.isfinite(result.snr_db)
-            assert result.beams_tested == config.n_antennas
+            assert result.beams_tested == config.n_beams
+
+
+def test_each_sector_serves_its_own_street_direction_with_full_gain() -> None:
+    config = _config()
+    expected_gain_db = float(linear_to_db(config.n_antennas)) + config.element_peak_gain_dbi
+    for sector_idx, boresight_azimuth in enumerate(config.sector_boresight_azimuths):
+        result = _run(_single_path_at(boresight_azimuth), config)
+        beam_sector_idx = result.beam_idx // config.n_beams_per_sector
+        assert beam_sector_idx == sector_idx
+        assert result.serving_sector == sector_idx
+        assert result.beamforming_gain_db == pytest.approx(expected_gain_db, abs=SECTOR_GAIN_TOLERANCE_DB)
+
+
+def test_opposite_street_directions_are_no_longer_confused() -> None:
+    config = _config()
+    forward = _run(_single_path_at(0.0), config)
+    backward = _run(_single_path_at(np.pi), config)
+    assert forward.serving_sector != backward.serving_sector
+    assert forward.beamforming_gain_db == pytest.approx(backward.beamforming_gain_db, abs=1e-3)
+
+
+def test_methods_are_ordered_ai_sweep_wideband_mrt_subcarrier_mrt() -> None:
+    config = _config()
+    rng = np.random.default_rng(11)
+    for seed in range(N_ORDERING_CHANNELS):
+        paths = _multipath(seed, LONG_DELAY_SPREAD_S, SYNTHETIC_DELAY_DECAY_S, FULL_AZIMUTH_SPAN)
+        candidates = rng.choice(config.n_beams, N_AI_CANDIDATES, replace=False).astype(np.int64)
+        gains_db = [
+            _run(paths, config, method=method, candidate_beams=candidates).beamforming_gain_db
+            for method in (
+                BeamMethod.AI_TOP_K,
+                BeamMethod.SWEEP,
+                BeamMethod.MRT_WIDEBAND,
+                BeamMethod.MRT_SUBCARRIER,
+            )
+        ]
+        assert np.all(np.diff(gains_db) >= -ORDERING_TOLERANCE_DB)
+
+
+def test_plotted_beam_pattern_matches_the_simulated_effective_channel() -> None:
+    config = _config()
+    for azimuth, zenith in ((0.3, 1.7), (2.2, 1.6), (-1.4, 1.75), (3.0, np.pi / 2)):
+        for method in (BeamMethod.SWEEP, BeamMethod.MRT_WIDEBAND):
+            result = _run(_single_path_at(azimuth, zenith), config, method=method)
+            pattern = array_beam_pattern(
+                result.beam_weights, np.full(1, azimuth, dtype=np.float32), zenith, config
+            )
+            assert np.allclose(np.abs(result.h_eff_true) ** 2, pattern[0], rtol=1e-4)

@@ -17,6 +17,7 @@ from beamlink.config import (
     Modulation,
     SimulationMode,
     SystemConfig,
+    single_isotropic_panel,
 )
 from beamlink.data import ChannelPaths, position_paths, synthetic_paths
 from beamlink.link import LinkResult, run_link
@@ -92,7 +93,7 @@ def _link(
 
 
 def build_ber_figure(config: SystemConfig, rng: np.random.Generator, seed: int, out_path: Path) -> None:
-    siso = replace(config, n_antennas=1)
+    siso = single_isotropic_panel(replace(config, n_antennas=1))
     multipath = position_paths(synthetic_channel(rng, 1, los_k_factor_db=None), 0)
     fine_snr_db = np.linspace(BER_SNR_DB[0], BER_SNR_DB[-1], 200)
     figure, panels = plt.subplots(1, 3, figsize=(15, 4.8), sharey=True)
@@ -159,7 +160,7 @@ def build_ber_figure(config: SystemConfig, rng: np.random.Generator, seed: int, 
 
 
 def _cp_panel(panel: Axes, config: SystemConfig, rng: np.random.Generator, seed: int) -> None:
-    siso = replace(config, n_antennas=1)
+    siso = single_isotropic_panel(replace(config, n_antennas=1))
     paths = position_paths(
         synthetic_channel(
             rng, 1, los_k_factor_db=None, max_delay_s=LONG_DELAY_SPREAD_S, delay_decay_s=LONG_DELAY_DECAY_S
@@ -210,7 +211,7 @@ def _cp_panel(panel: Axes, config: SystemConfig, rng: np.random.Generator, seed:
 def build_diagnostics_figure(
     config: SystemConfig, rng: np.random.Generator, seed: int, out_path: Path
 ) -> None:
-    siso = replace(config, n_antennas=1)
+    siso = single_isotropic_panel(replace(config, n_antennas=1))
     paths = position_paths(synthetic_channel(rng, 1, los_k_factor_db=None), 0)
     result = _link(
         paths,

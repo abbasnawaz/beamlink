@@ -1,23 +1,24 @@
 import argparse
 import logging
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
 import numpy.typing as npt
 
-from beamlink.array import ula_steering_vectors
-from beamlink.beamforming import dft_codebook, sweep_beams
+from beamlink.beamforming import sweep_beams
 from beamlink.channel import paths_to_cfr, time_aligned_delays
 from beamlink.config import (
     DATASET_FILENAME,
-    N_WIDE_BEAMS,
     SPLIT_TEST,
     SPLIT_TRAIN,
     SPLIT_VALIDATION,
+    WIDE_BEAM_ELEMENTS,
     SystemConfig,
     load_config,
 )
 from beamlink.data import ChannelPaths, Dataset, Labels, dataset_arrays, load_dataset
+from beamlink.link import array_response, system_codebook
 from beamlink.linkbudget import linear_to_db
 
 logger = logging.getLogger("beamlink.offline")
@@ -43,32 +44,20 @@ def paths_slice(paths: ChannelPaths, rows: slice) -> ChannelPaths:
     )
 
 
-def position_cfr(paths: ChannelPaths, config: SystemConfig, n_antennas: int) -> npt.NDArray[np.complex64]:
-    steering = ula_steering_vectors(
-        paths.path_azimuth,
-        paths.path_zenith,
-        n_antennas=n_antennas,
-        spacing_wavelengths=config.antenna_spacing_wavelengths,
-        boresight_azimuth=config.bs_boresight_azimuth,
-    )
+def position_cfr(paths: ChannelPaths, config: SystemConfig) -> npt.NDArray[np.complex64]:
     return paths_to_cfr(
         np.where(paths.path_valid, paths.path_gain, 0.0).astype(np.complex64),
         time_aligned_delays(paths.path_delay_s, paths.path_valid),
-        steering,
+        array_response(paths.path_azimuth, paths.path_zenith, config),
         n_subcarriers=config.n_subcarriers,
         subcarrier_spacing_hz=config.subcarrier_spacing_hz,
     )
 
 
-def beam_power_db(
-    paths: ChannelPaths, config: SystemConfig, codebook: npt.NDArray[np.complex64]
-) -> npt.NDArray[np.float32]:
-    n_antennas = codebook.shape[-1]
+def beam_power_db(paths: ChannelPaths, config: SystemConfig) -> npt.NDArray[np.float32]:
+    codebook = system_codebook(config)
     chunks = [
-        sweep_beams(
-            position_cfr(paths_slice(paths, slice(start, start + CHUNK_POSITIONS)), config, n_antennas),
-            codebook,
-        )
+        sweep_beams(position_cfr(paths_slice(paths, slice(start, start + CHUNK_POSITIONS)), config), codebook)
         for start in range(0, paths.path_gain.shape[0], CHUNK_POSITIONS)
     ]
     return linear_to_db(np.concatenate(chunks) / config.n_subcarriers)
@@ -95,25 +84,18 @@ def build_labels(dataset: Dataset, config: SystemConfig, rng: np.random.Generato
     power_by_antennas: dict[int, npt.NDArray[np.float32]] = {}
     best_by_antennas: dict[int, npt.NDArray[np.int16]] = {}
     for n_antennas in config.label_antenna_counts:
-        codebook = dft_codebook(
-            n_antennas=n_antennas,
-            oversampling=config.codebook_oversampling,
-            spacing_wavelengths=config.antenna_spacing_wavelengths,
-            sector=config.codebook_sector,
-        )
-        power_by_antennas[n_antennas] = beam_power_db(dataset.paths, config, codebook)
+        power_by_antennas[n_antennas] = beam_power_db(dataset.paths, replace(config, n_antennas=n_antennas))
         best_by_antennas[n_antennas] = np.argmax(power_by_antennas[n_antennas], axis=-1).astype(np.int16)
-    wide_codebook = dft_codebook(
-        n_antennas=N_WIDE_BEAMS,
-        oversampling=1,
-        spacing_wavelengths=config.antenna_spacing_wavelengths,
-        sector=None,
+    wide_config = replace(
+        config, n_antennas=WIDE_BEAM_ELEMENTS, codebook_oversampling=1, codebook_sector=None
     )
     return Labels(
         beam_power_db=power_by_antennas,
         best_beam=best_by_antennas,
-        wide_beam_power_db=beam_power_db(dataset.paths, config, wide_codebook),
+        wide_beam_power_db=beam_power_db(dataset.paths, wide_config),
         split=spatial_split(dataset.positions_m, config, rng),
+        sector_boresight_azimuths=np.asarray(config.sector_boresight_azimuths, dtype=np.float32),
+        sector_downtilt=config.sector_downtilt,
     )
 
 

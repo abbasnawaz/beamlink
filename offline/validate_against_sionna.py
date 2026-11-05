@@ -1,6 +1,7 @@
 import argparse
 import importlib
 import logging
+from dataclasses import replace
 from pathlib import Path
 
 import matplotlib
@@ -9,10 +10,10 @@ import numpy as np
 import numpy.typing as npt
 import sionna.rt as rt
 
-from beamlink.array import ula_steering_vectors
 from beamlink.channel import paths_to_cfr, subcarrier_frequencies_hz
-from beamlink.config import SIONNA_CFR_TOLERANCE, SystemConfig, load_config
+from beamlink.config import SIONNA_CFR_TOLERANCE, SIONNA_TILTED_CFR_TOLERANCE, SystemConfig, load_config
 from beamlink.data import ChannelPaths, Dataset, load_dataset
+from beamlink.link import array_response
 from beamlink.linkbudget import linear_to_db
 
 generate = importlib.import_module("01_generate_rt_dataset")
@@ -66,22 +67,40 @@ def all_single_antenna_paths(
     return generate.concatenate_traces(traces, width).paths
 
 
-def numpy_cfr(paths: ChannelPaths, config: SystemConfig, n_antennas: int) -> npt.NDArray[np.complex64]:
-    steering = ula_steering_vectors(
-        paths.path_azimuth,
-        paths.path_zenith,
-        n_antennas=n_antennas,
-        spacing_wavelengths=config.antenna_spacing_wavelengths,
-        boresight_azimuth=config.bs_boresight_azimuth,
-    )
+def sionna_sector_cfr(
+    positions_m: npt.NDArray[np.float64], config: SystemConfig, seed: int
+) -> npt.NDArray[np.complex128]:
+    sectors = []
+    for boresight_azimuth in config.sector_boresight_azimuths:
+        scene = generate.load_street_scene(
+            config,
+            n_bs_antennas=config.n_antennas,
+            pattern="tr38901",
+            orientation=(boresight_azimuth, config.sector_downtilt, 0.0),
+        )
+        sectors.append(np.stack([sionna_cfr_at(scene, point, config, seed) for point in positions_m]))
+    return np.concatenate(sectors, axis=-2)
+
+
+def numpy_cfr(paths: ChannelPaths, config: SystemConfig) -> npt.NDArray[np.complex64]:
     gain = np.where(paths.path_valid, paths.path_gain, 0.0).astype(np.complex64)
     return paths_to_cfr(
         gain,
         paths.path_delay_s,
-        steering,
+        array_response(paths.path_azimuth, paths.path_zenith, config),
         n_subcarriers=config.n_subcarriers,
         subcarrier_spacing_hz=config.subcarrier_spacing_hz,
     )
+
+
+def strongest_sector_rows(cfr: npt.NDArray[np.complex128], n_antennas: int) -> slice:
+    sector_power = np.sum(np.abs(cfr) ** 2, axis=-1).reshape(-1, n_antennas).sum(axis=-1)
+    sector_idx = int(np.argmax(sector_power))
+    return slice(sector_idx * n_antennas, (sector_idx + 1) * n_antennas)
+
+
+def cfr_tolerance(config: SystemConfig) -> float:
+    return SIONNA_TILTED_CFR_TOLERANCE if config.sector_downtilt != 0.0 else SIONNA_CFR_TOLERANCE
 
 
 def relative_error(
@@ -97,10 +116,12 @@ def _magnitude_panel(
     responses: tuple[npt.NDArray[np.complex128], npt.NDArray[np.complex64], npt.NDArray[np.complex64]],
     title: str,
     max_paths: int,
+    n_antennas: int,
 ) -> None:
     sionna, all_paths, stored = responses
-    for antenna_idx, width in ((0, 2.5), (-1, 1.5)):
-        label_suffix = f"antenna {antenna_idx % sionna.shape[0]}"
+    rows = np.arange(sionna.shape[0])[strongest_sector_rows(sionna, n_antennas)]
+    for antenna_idx, width in ((rows[0], 2.5), (rows[-1], 1.5)):
+        label_suffix = f"antenna {antenna_idx}"
         panel.plot(
             frequency_megahertz,
             linear_to_db(np.abs(sionna[antenna_idx]) ** 2),
@@ -118,11 +139,11 @@ def _magnitude_panel(
         )
     panel.plot(
         frequency_megahertz,
-        linear_to_db(np.abs(stored[0]) ** 2),
+        linear_to_db(np.abs(stored[rows[0]]) ** 2),
         ":",
         color=TRUNCATED_COLOR,
         lw=2,
-        label=f"NumPy, stored {max_paths} strongest, antenna 0",
+        label=f"NumPy, stored {max_paths} strongest, antenna {rows[0]}",
     )
     panel.set_xlabel("Baseband frequency (MHz)")
     panel.set_ylabel("|H| (dB)")
@@ -149,13 +170,21 @@ def build_validation_figure(
     for panel, pick, kind in ((panels[0, 0], los_pick, "LOS"), (panels[0, 1], nlos_pick, "NLOS")):
         responses = (sionna[pick], all_paths[pick], stored[pick])
         _magnitude_panel(
-            panel, frequency_megahertz, responses, f"{kind} position: |H| per antenna", config.max_paths
+            panel,
+            frequency_megahertz,
+            responses,
+            f"{kind} position: |H| of the strongest sector",
+            config.max_paths,
+            config.n_antennas,
         )
-    phase_difference = np.angle(all_paths[nlos_pick] * np.conj(sionna[nlos_pick]))
+    serving_rows = strongest_sector_rows(sionna[nlos_pick], config.n_antennas)
+    phase_difference = np.angle(all_paths[nlos_pick, serving_rows] * np.conj(sionna[nlos_pick, serving_rows]))
     panels[1, 0].plot(frequency_megahertz, np.rad2deg(phase_difference.T), color=NUMPY_COLOR, lw=1, alpha=0.6)
     panels[1, 0].set_xlabel("Baseband frequency (MHz)")
     panels[1, 0].set_ylabel("Phase(NumPy) - phase(Sionna) (deg)")
-    panels[1, 0].set_title(f"NLOS position: phase difference, all {sionna.shape[1]} antennas")
+    panels[1, 0].set_title(
+        f"NLOS position: phase difference, {config.n_antennas} antennas of the serving sector"
+    )
     convention = relative_error(sionna, all_paths)
     truncation = relative_error(sionna, stored)
     position_axis = np.arange(convention.size)
@@ -169,7 +198,7 @@ def build_validation_figure(
         color=TRUNCATED_COLOR,
         label=f"stored {config.max_paths} strongest",
     )
-    panels[1, 1].axhline(SIONNA_CFR_TOLERANCE, color=NEUTRAL, ls="--", lw=1.5, label="tolerance")
+    panels[1, 1].axhline(cfr_tolerance(config), color=NEUTRAL, ls="--", lw=1.5, label="tolerance")
     panels[1, 1].set_yscale("log")
     panels[1, 1].set_xticks(position_axis, ["LOS" if los else "NLOS" for los in is_los], fontsize=8)
     panels[1, 1].set_ylabel("Relative CFR error ||H_numpy - H_sionna|| / ||H_sionna||")
@@ -184,20 +213,16 @@ def build_validation_figure(
     logger.info(f"wrote {out_path}")
 
 
-def main() -> None:
-    args = parse_args()
-    matplotlib.use("Agg")
-    config = load_config(args.config)
-    n_antennas = args.n_antennas or config.n_antennas
-    rng = np.random.default_rng(args.seed)
-    dataset = load_dataset(args.data_dir)
-    chosen = pick_positions(dataset, args.n_positions, rng)
+def validate_tilt(
+    config: SystemConfig,
+    dataset: Dataset,
+    chosen: npt.NDArray[np.int64],
+    traced_paths: ChannelPaths,
+    seed: int,
+) -> tuple[npt.NDArray[np.complex128], npt.NDArray[np.complex64], npt.NDArray[np.complex64], bool]:
     positions_m = dataset.positions_m[chosen].astype(np.float64)
-    array_scene = generate.load_street_scene(config, n_bs_antennas=n_antennas)
-    reference = np.stack([sionna_cfr_at(array_scene, point, config, args.seed) for point in positions_m])
-    single_antenna_scene = generate.load_street_scene(config, n_bs_antennas=1)
-    traced_paths = all_single_antenna_paths(single_antenna_scene, positions_m, config, args.seed)
-    all_paths = numpy_cfr(traced_paths, config, n_antennas)
+    reference = sionna_sector_cfr(positions_m, config, seed)
+    all_paths = numpy_cfr(traced_paths, config)
     stored_paths = ChannelPaths(
         path_gain=dataset.paths.path_gain[chosen],
         path_delay_s=dataset.paths.path_delay_s[chosen],
@@ -205,21 +230,49 @@ def main() -> None:
         path_zenith=dataset.paths.path_zenith[chosen],
         path_valid=dataset.paths.path_valid[chosen],
     )
-    stored = numpy_cfr(stored_paths, config, n_antennas)
+    stored = numpy_cfr(stored_paths, config)
     convention, truncation = relative_error(reference, all_paths), relative_error(reference, stored)
     total_paths = traced_paths.path_valid.sum(axis=-1)
+    downtilt_deg = np.rad2deg(config.sector_downtilt)
     for row, position_idx in enumerate(chosen):
+        serving_rows = strongest_sector_rows(reference[row], config.n_antennas)
+        serving_error = relative_error(reference[row, serving_rows], all_paths[row, serving_rows])
         logger.info(
-            f"position={position_idx} los={bool(dataset.is_los[position_idx])} "
-            f"paths_total={total_paths[row]} error_all_paths={convention[row]:.2e} "
-            f"error_stored={truncation[row]:.2e}"
+            f"downtilt_deg={downtilt_deg:.1f} position={position_idx} "
+            f"los={bool(dataset.is_los[position_idx])} paths_total={total_paths[row]} "
+            f"error_all_paths={convention[row]:.2e} "
+            f"error_serving_sector={serving_error:.2e} error_stored={truncation[row]:.2e}"
         )
+    tolerance = cfr_tolerance(config)
     logger.info(
-        f"n_antennas={n_antennas} max_error_all_paths={convention.max():.2e} "
-        f"max_error_stored_{config.max_paths}={truncation.max():.2e} tolerance={SIONNA_CFR_TOLERANCE:.0e}"
+        f"n_antennas={config.n_antennas} n_sectors={config.n_sectors} downtilt_deg={downtilt_deg:.1f} "
+        f"max_error_all_paths={convention.max():.2e} "
+        f"max_error_stored_{config.max_paths}={truncation.max():.2e} tolerance={tolerance:.0e}"
     )
+    return reference, all_paths, stored, bool(convention.max() <= tolerance)
+
+
+def main() -> None:
+    args = parse_args()
+    matplotlib.use("Agg")
+    config = load_config(args.config)
+    config = replace(config, n_antennas=args.n_antennas or config.n_antennas)
+    rng = np.random.default_rng(args.seed)
+    dataset = load_dataset(args.data_dir)
+    chosen = pick_positions(dataset, args.n_positions, rng)
+    positions_m = dataset.positions_m[chosen].astype(np.float64)
+    single_antenna_scene = generate.load_street_scene(config, n_bs_antennas=1)
+    traced_paths = all_single_antenna_paths(single_antenna_scene, positions_m, config, args.seed)
+    untilted = validate_tilt(replace(config, sector_downtilt=0.0), dataset, chosen, traced_paths, args.seed)
+    passed = untilted[-1]
+    reference, all_paths, stored = untilted[:3]
+    if config.sector_downtilt != 0.0:
+        reference, all_paths, stored, tilted_passed = validate_tilt(
+            config, dataset, chosen, traced_paths, args.seed
+        )
+        passed = passed and tilted_passed
     build_validation_figure(reference, all_paths, stored, dataset.is_los[chosen], config, args.out)
-    if convention.max() > SIONNA_CFR_TOLERANCE:
+    if not passed:
         logger.error("NumPy CFR does not match Sionna RT within tolerance")
         raise SystemExit(1)
 

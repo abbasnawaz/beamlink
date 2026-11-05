@@ -8,7 +8,7 @@ from evaluate_link import synthetic_channel
 from evaluate_style import CATEGORICAL, METHOD_COLORS, METHOD_LABELS, NEUTRAL, save_figure, style_axes
 from matplotlib.axes import Axes
 
-from beamlink.array import beam_pattern, steered_beam_weights, ula_steering_vectors
+from beamlink.array import beam_pattern, element_field_pattern, steered_beam_weights, ula_steering_vectors
 from beamlink.beamforming import (
     beamforming_gain,
     codebook_beam_azimuths,
@@ -23,10 +23,13 @@ from beamlink.beamforming import (
 )
 from beamlink.channel import paths_to_cfr
 from beamlink.config import (
+    RT_TRACE_YAW,
     BeamMethod,
     SystemConfig,
+    single_isotropic_panel,
 )
 from beamlink.data import ChannelPaths, position_paths
+from beamlink.link import array_beam_pattern, system_codebook
 from beamlink.linkbudget import linear_to_db
 from beamlink.metrics import power_loss_db
 
@@ -34,21 +37,26 @@ logger = logging.getLogger("beamlink.offline")
 
 PATTERN_FLOOR_DB = -25.0
 PATTERN_GRID = np.linspace(-np.pi / 2, np.pi / 2, 1801, dtype=np.float32)
+FULL_CIRCLE_GRID = np.linspace(-np.pi, np.pi, 3601, dtype=np.float32)
 ANTENNA_COUNTS = (4, 8, 16, 32)
 GAIN_STUDY_POSITIONS = 400
 LOS_K_FACTOR_DB = 10.0
 OVERSAMPLED = 4
+PATTERN_FIGURE_NOTE = (
+    "(a)-(c): one isotropic ULA, boresight up, positive azimuth to the left. "
+    "(d): absolute azimuth from +x, counter-clockwise seen from above (Sionna frame)."
+)
 
 
 def _pattern_db(beam_weights: npt.NDArray[np.complex64], config: SystemConfig) -> npt.NDArray[np.float32]:
-    pattern = beam_pattern(
-        beam_weights,
+    steering = ula_steering_vectors(
         PATTERN_GRID,
-        zenith=np.pi / 2,
+        np.pi / 2,
+        n_antennas=beam_weights.shape[-1],
         spacing_wavelengths=config.antenna_spacing_wavelengths,
         boresight_azimuth=0.0,
     )
-    return np.maximum(linear_to_db(pattern), PATTERN_FLOOR_DB)
+    return np.maximum(linear_to_db(beam_pattern(beam_weights, steering)), PATTERN_FLOOR_DB)
 
 
 def _half_polar(panel: Axes, max_db: float) -> None:
@@ -99,10 +107,71 @@ def _beam_weights(
     return spread_over_subcarriers(codebook[best], n_subcarriers=n_subcarriers)
 
 
+def _full_circle_db(
+    beam_weights: npt.NDArray[np.complex64], config: SystemConfig, zenith: float
+) -> npt.NDArray[np.float32]:
+    pattern = array_beam_pattern(beam_weights, FULL_CIRCLE_GRID, zenith, config)
+    return np.maximum(linear_to_db(pattern), PATTERN_FLOOR_DB)
+
+
+def _sectors_panel(panel: Axes, config: SystemConfig) -> None:
+    single_ula = single_isotropic_panel(config, boresight_azimuth=RT_TRACE_YAW)
+    toward_street = np.zeros(1, dtype=np.float32)
+    ula_codebook = system_codebook(single_ula)
+    ula_best = int(np.argmax(array_beam_pattern(ula_codebook, toward_street, np.pi / 2, single_ula)[:, 0]))
+    sector_codebook = system_codebook(config)
+    zenith = np.pi / 2 + config.sector_downtilt
+    sector_best = int(np.argmax(array_beam_pattern(sector_codebook, toward_street, zenith, config)[:, 0]))
+    for sector_idx, boresight_azimuth in enumerate(config.sector_boresight_azimuths):
+        element = element_field_pattern(
+            FULL_CIRCLE_GRID,
+            zenith,
+            boresight_azimuth=boresight_azimuth,
+            downtilt=config.sector_downtilt,
+            peak_gain_dbi=config.element_peak_gain_dbi,
+            beamwidth=config.element_beamwidth,
+            front_to_back_db=config.element_front_to_back_db,
+        )
+        panel.plot(
+            FULL_CIRCLE_GRID,
+            np.maximum(linear_to_db(element**2), PATTERN_FLOOR_DB),
+            color=CATEGORICAL[sector_idx],
+            lw=1.2,
+            alpha=0.7,
+            label=f"sector {sector_idx} element ({np.rad2deg(boresight_azimuth):.0f} deg)",
+        )
+    panel.plot(
+        FULL_CIRCLE_GRID,
+        _full_circle_db(ula_codebook[ula_best], single_ula, np.pi / 2),
+        color=NEUTRAL,
+        lw=2,
+        ls="--",
+        label=f"v1: single ULA, best beam {ula_best} (two mirror lobes)",
+    )
+    panel.plot(
+        FULL_CIRCLE_GRID,
+        _full_circle_db(sector_codebook[sector_best], config, zenith),
+        color=METHOD_COLORS[BeamMethod.SWEEP],
+        lw=2.5,
+        label=f"v2: four sectors, best beam {sector_best} (sector 0)",
+    )
+    peak_db = float(linear_to_db(config.n_antennas)) + config.element_peak_gain_dbi
+    panel.set_theta_zero_location("E")
+    panel.set_rlim(PATTERN_FLOOR_DB, peak_db + 2)
+    panel.set_rticks(np.arange(-20.0, peak_db + 2, 10.0))
+    panel.tick_params(labelsize=8)
+    panel.set_title(
+        f"(d) N = {config.n_antennas}, beam towards the +x street (0 deg):\n"
+        "single ULA vs four sectors with TR 38.901 elements (dBi)",
+        fontsize=11,
+    )
+    panel.legend(loc="upper left", bbox_to_anchor=(1.02, 1.0), fontsize=8, frameon=False)
+
+
 def build_beam_pattern_figure(config: SystemConfig, out_path: Path) -> None:
-    figure = plt.figure(figsize=(17, 4.4))
+    figure = plt.figure(figsize=(15, 11))
     n_antennas = 8
-    panel = figure.add_subplot(1, 3, 1, projection="polar")
+    panel = figure.add_subplot(2, 2, 1, projection="polar")
     codebook = _codebook(config, n_antennas, 1)
     beam_azimuths = codebook_beam_azimuths(
         n_antennas=n_antennas,
@@ -125,7 +194,7 @@ def build_beam_pattern_figure(config: SystemConfig, out_path: Path) -> None:
     panel.set_title("(a) N = 8 orthonormal DFT codebook\ngain (dBi, relative to one antenna)", fontsize=11)
     panel.legend(loc="lower center", bbox_to_anchor=(0.5, -0.02), ncol=2, fontsize=8, frameon=False)
 
-    panel = figure.add_subplot(1, 3, 2, projection="polar")
+    panel = figure.add_subplot(2, 2, 2, projection="polar")
     for color, count in zip(CATEGORICAL, ANTENNA_COUNTS, strict=False):
         weights = steered_beam_weights(
             0.0,
@@ -145,7 +214,7 @@ def build_beam_pattern_figure(config: SystemConfig, out_path: Path) -> None:
     panel.set_title("(b) Broadside beam: more antennas give\nmore gain and a narrower beam", fontsize=11)
     panel.legend(loc="lower center", bbox_to_anchor=(0.5, 0.06), ncol=2, fontsize=8, frameon=False)
 
-    panel = figure.add_subplot(1, 3, 3, projection="polar")
+    panel = figure.add_subplot(2, 2, 3, projection="polar")
     n_antennas = 16
     two_paths = ChannelPaths(
         path_gain=np.array([1.0, 0.8 * np.exp(1j)], dtype=np.complex64),
@@ -182,15 +251,9 @@ def build_beam_pattern_figure(config: SystemConfig, out_path: Path) -> None:
         fontsize=11,
     )
     panel.legend(loc="lower center", bbox_to_anchor=(0.5, 0.06), ncol=2, fontsize=8, frameon=False)
-    figure.text(
-        0.5,
-        -0.02,
-        "Boresight is up. Positive azimuth is to the left (counter-clockwise seen from above, Sionna frame).",
-        ha="center",
-        fontsize=9,
-        color=NEUTRAL,
-    )
-    figure.subplots_adjust(wspace=0.15, left=0.02, right=0.98, top=0.86, bottom=0.0)
+    _sectors_panel(figure.add_subplot(2, 2, 4, projection="polar"), config)
+    figure.text(0.5, 0.01, PATTERN_FIGURE_NOTE, ha="center", fontsize=9, color=NEUTRAL)
+    figure.subplots_adjust(wspace=0.35, hspace=0.3, left=0.02, right=0.84, top=0.94, bottom=0.04)
     save_figure(figure, out_path)
 
 

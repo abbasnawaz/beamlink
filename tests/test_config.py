@@ -1,3 +1,4 @@
+import math
 from pathlib import Path
 
 import pytest
@@ -52,3 +53,12 @@ def test_wrong_type_is_rejected(tmp_path: Path) -> None:
 def test_sector_list_becomes_float_tuple(tmp_path: Path) -> None:
     config = load_config(_write_variant(tmp_path, codebook_sector=[-1, 1]))
     assert config.codebook_sector == (-1.0, 1.0)
+
+
+def test_default_config_has_four_tilted_sectors() -> None:
+    config = load_config(CONFIG_PATH)
+    assert config.sector_boresight_azimuths == pytest.approx((0.0, math.pi / 2, math.pi, 3 * math.pi / 2))
+    assert config.sector_downtilt == pytest.approx(math.radians(10.0))
+    assert config.element_beamwidth == pytest.approx(math.radians(65.0))
+    assert config.n_sectors == 4
+    assert config.n_beams == config.n_sectors * config.codebook_oversampling * config.n_antennas

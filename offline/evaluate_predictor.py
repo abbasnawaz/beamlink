@@ -41,10 +41,9 @@ logger = logging.getLogger("beamlink.offline")
 
 MODEL_STYLES = {
     FeatureSet.POSITION: ("Model A (position)", "-"),
-    FeatureSet.POSITION_WIDE_BEAMS: ("Model B (position + 4 wide beams)", "--"),
+    FeatureSet.POSITION_WIDE_BEAMS: ("Model B (position + wide-beam probes)", "--"),
 }
 ANTENNA_COLORS = {8: CATEGORICAL[0], 16: CATEGORICAL[1]}
-LOSS_CDF_K = 3
 POSITION_BER_SNR_DB = np.arange(-10.0, 22.0, 4.0)
 POSITION_BER_SLOTS = 6
 SHORT_PREFIX_LENGTH = 2
@@ -71,8 +70,11 @@ def _checkpoint_top_k(
     return training.predicted_top_k(model, normalized, n_candidates)
 
 
-def _accuracy_panels(panels: npt.NDArray[np.object_], dataset: Dataset, checkpoint: dict[str, dict]) -> None:
+def _accuracy_panels(
+    panels: npt.NDArray[np.object_], dataset: Dataset, config: SystemConfig, checkpoint: dict[str, dict]
+) -> None:
     test = dataset.labels.split == SPLIT_TEST
+    loss_k = config.predictor_top_k
     for feature_set, (label, dash) in MODEL_STYLES.items():
         for n_antennas, color in ANTENNA_COLORS.items():
             entry = checkpoint[training.model_key(feature_set, n_antennas)]
@@ -80,7 +82,7 @@ def _accuracy_panels(panels: npt.NDArray[np.object_], dataset: Dataset, checkpoi
             best = dataset.labels.best_beam[n_antennas][test].astype(np.int64)
             ranking = _checkpoint_top_k(entry, dataset, feature_set, power_db.shape[1])[test]
             k_values = np.arange(1, power_db.shape[1] + 1)
-            measured = (k_values + n_probe_beams(feature_set)) / power_db.shape[1]
+            measured = (k_values + n_probe_beams(feature_set, config.n_wide_beams)) / power_db.shape[1]
             accuracy = [top_k_accuracy(ranking[:, :n_candidates], best) for n_candidates in k_values]
             mean_loss = [
                 float(top_k_power_loss_db(power_db, ranking[:, :n_candidates]).mean())
@@ -89,22 +91,24 @@ def _accuracy_panels(panels: npt.NDArray[np.object_], dataset: Dataset, checkpoi
             name = f"{label}, N = {n_antennas}"
             panels[0].plot(measured, accuracy, dash, color=color, marker="o", ms=4, lw=2, label=name)
             panels[1].plot(measured, mean_loss, dash, color=color, marker="o", ms=4, lw=2, label=name)
-            loss = np.sort(top_k_power_loss_db(power_db, ranking[:, :LOSS_CDF_K]))
+            loss = np.sort(top_k_power_loss_db(power_db, ranking[:, :loss_k]))
             panels[2].plot(loss, np.arange(1, loss.size + 1) / loss.size, dash, color=color, lw=2, label=name)
     panels[0].set_ylabel("Top-K accuracy (best beam among the K tested)")
     panels[1].set_ylabel("Mean power loss vs exhaustive sweep (dB)")
     for panel in panels[:2]:
         panel.set_xlabel("Beams measured / codebook size (K + wide-beam probes) / B")
         panel.axvline(1.0, color=NEUTRAL, ls=":", lw=1.5)
-    panels[2].set_xlabel(f"Power loss with K = {LOSS_CDF_K} (dB)")
+    panels[2].set_xlabel(f"Power loss with K = {loss_k} (dB)")
     panels[2].set_ylabel("Fraction of test positions")
     panels[2].set_xlim(-0.2, 6.0)
 
 
-def build_prediction_figure(dataset: Dataset, checkpoint_path: Path, out_path: Path) -> None:
+def build_prediction_figure(
+    dataset: Dataset, config: SystemConfig, checkpoint_path: Path, out_path: Path
+) -> None:
     checkpoint = torch.load(checkpoint_path, weights_only=True)
     figure, panels = plt.subplots(1, 3, figsize=(19, 5.4))
-    _accuracy_panels(panels, dataset, checkpoint)
+    _accuracy_panels(panels, dataset, config, checkpoint)
     titles = (
         "Accuracy vs measurement overhead",
         "Mean power loss vs overhead",
@@ -229,7 +233,7 @@ def _ber_panel(
         label="AWGN theory (no beamforming gain)",
     )
     panel.set_ylim(BER_FLOOR, 0.6)
-    panel.set_xlabel("Per-antenna SNR before beamforming (dB)")
+    panel.set_xlabel("SNR at one isotropic antenna, before beamforming (dB)")
     panel.set_ylabel("Bit error rate")
     style_axes(panel)
 
@@ -264,7 +268,7 @@ def _prefix_panel(panel: Axes, dataset: Dataset, config: SystemConfig, position_
             label=f"CP = {prefix_length} samples",
         )
     panel.set_ylim(BER_FLOOR, 0.6)
-    panel.set_xlabel("Per-antenna SNR before beamforming (dB)")
+    panel.set_xlabel("SNR at one isotropic antenna, before beamforming (dB)")
     panel.set_ylabel("Bit error rate")
     panel.set_title("16-QAM, time-domain sim, sweep beam")
     panel.legend(frameon=False, fontsize=8)

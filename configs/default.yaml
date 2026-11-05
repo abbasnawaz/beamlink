@@ -10,8 +10,12 @@ pilot_seed: 1234
 
 n_antennas: 8
 antenna_spacing_wavelengths: 0.5
-bs_boresight_azimuth: 1.5707963267948966
-codebook_oversampling: 1
+sector_boresight_azimuths: [0.0, 1.5707963267948966, 3.141592653589793, 4.71238898038469]
+sector_downtilt: 0.17453292519943295
+element_peak_gain_dbi: 8.0
+element_beamwidth: 1.1344640137963142
+element_front_to_back_db: 30.0
+codebook_oversampling: 2
 codebook_sector: null
 
 n_cir_precursor_taps: 4
@@ -44,4 +48,4 @@ predictor_epochs: 150
 predictor_batch_size: 256
 predictor_learning_rate: 1.0e-3
 soft_label_temperature_db: 1.0
-predictor_top_k: 3
+predictor_top_k: 10

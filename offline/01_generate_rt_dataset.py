@@ -17,6 +17,7 @@ from beamlink.config import (
     DATASET_FILENAME,
     DATASET_SCHEMA_VERSION,
     META_FILENAME,
+    RT_TRACE_YAW,
     SCENE_IMAGE_FILENAME,
     TOPDOWN_HALF_WIDTH_M,
     TOPDOWN_RESOLUTION_PX,
@@ -58,20 +59,27 @@ def bs_position_m(config: SystemConfig) -> npt.NDArray[np.float64]:
     return np.array([*config.bs_position_xy_m, config.bs_height_m], dtype=np.float64)
 
 
-def load_street_scene(config: SystemConfig, n_bs_antennas: int) -> rt.Scene:
+def load_street_scene(
+    config: SystemConfig,
+    n_bs_antennas: int,
+    *,
+    pattern: str = "iso",
+    orientation: tuple[float, float, float] = (RT_TRACE_YAW, 0.0, 0.0),
+) -> rt.Scene:
     scene = rt.load_scene(getattr(rt.scene, config.scene_name), merge_shapes=False)
     scene.frequency = config.carrier_frequency_hz
     scene.tx_array = rt.PlanarArray(
         num_rows=1,
         num_cols=n_bs_antennas,
         horizontal_spacing=config.antenna_spacing_wavelengths,
-        pattern="iso",
+        pattern=pattern,
         polarization="V",
     )
     scene.rx_array = rt.PlanarArray(num_rows=1, num_cols=1, pattern="iso", polarization="V")
     position = bs_position_m(config)
-    orientation = mi.Point3f(config.bs_boresight_azimuth, 0.0, 0.0)
-    scene.add(rt.Transmitter(BS_DEVICE_NAME, position=point3f(position), orientation=orientation))
+    scene.add(
+        rt.Transmitter(BS_DEVICE_NAME, position=point3f(position), orientation=mi.Point3f(*orientation))
+    )
     return scene
 
 
@@ -245,7 +253,6 @@ def scene_meta(
         scene_name=config.scene_name,
         carrier_frequency_hz=config.carrier_frequency_hz,
         bs_position_m=tuple(float(value) for value in bs_position_m(config)),
-        bs_boresight_azimuth=config.bs_boresight_azimuth,
         grid_extent_m=config.ue_grid_extent_m,
         grid_spacing_m=config.grid_spacing_m,
         image_extent_m=image[0],

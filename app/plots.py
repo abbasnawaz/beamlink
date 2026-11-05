@@ -23,26 +23,39 @@ NEUTRAL = "#52514e"
 FAINT = "#c3c2b7"
 PLOT_MARGIN = {"l": 50, "r": 20, "t": 50, "b": 45}
 PATTERN_FLOOR_DB = -30.0
-POLAR_BORESIGHT_DEG = 90.0
-POLAR_TICKS_DEG = np.arange(-90.0, 91.0, 30.0)
+POLAR_TICKS_DEG = np.arange(0.0, 360.0, 45.0)
 
 
 def build_beam_pattern_figure(
-    relative_azimuth_deg: npt.NDArray[np.float32],
+    azimuth_deg: npt.NDArray[np.float32],
     pattern_db: npt.NDArray[np.float32],
     codebook_pattern_db: npt.NDArray[np.float32] | None,
     method: BeamMethod,
+    street_azimuths_deg: npt.NDArray[np.float64],
 ) -> go.Figure:
     figure = go.Figure()
+    peak_db = float(np.max(pattern_db)) + 2
+    for street_idx, street_deg in enumerate(street_azimuths_deg):
+        figure.add_trace(
+            go.Scatterpolar(
+                r=[PATTERN_FLOOR_DB, peak_db],
+                theta=[street_deg, street_deg],
+                mode="lines",
+                line={"color": NEUTRAL, "width": 1.5, "dash": "dash"},
+                name="Main street direction" if street_idx == 0 else None,
+                showlegend=street_idx == 0,
+                hoverinfo="skip",
+            )
+        )
     if codebook_pattern_db is not None:
         for beam_idx, beam_db in enumerate(codebook_pattern_db):
             figure.add_trace(
                 go.Scatterpolar(
                     r=np.maximum(beam_db, PATTERN_FLOOR_DB),
-                    theta=relative_azimuth_deg + POLAR_BORESIGHT_DEG,
+                    theta=azimuth_deg,
                     mode="lines",
                     line={"color": FAINT, "width": 1},
-                    name="Codebook beams" if beam_idx == 0 else None,
+                    name="Other beams of this sector" if beam_idx == 0 else None,
                     showlegend=beam_idx == 0,
                     hoverinfo="skip",
                 )
@@ -50,7 +63,7 @@ def build_beam_pattern_figure(
     figure.add_trace(
         go.Scatterpolar(
             r=np.maximum(pattern_db, PATTERN_FLOOR_DB),
-            theta=relative_azimuth_deg + POLAR_BORESIGHT_DEG,
+            theta=azimuth_deg,
             mode="lines",
             line={"color": METHOD_COLORS[method], "width": 3},
             name=METHOD_LABELS[method],
@@ -58,17 +71,17 @@ def build_beam_pattern_figure(
         )
     )
     figure.update_layout(
-        title="Beam pattern (gain vs angle from boresight, dBi)",
+        title="Beam pattern (gain vs absolute azimuth from +x, dBi)",
         height=420,
         margin=PLOT_MARGIN,
         polar={
-            "sector": [0, 180],
             "angularaxis": {
                 "direction": "counterclockwise",
-                "tickvals": POLAR_TICKS_DEG + POLAR_BORESIGHT_DEG,
-                "ticktext": [f"{tick:+.0f} deg" for tick in POLAR_TICKS_DEG],
+                "rotation": 0,
+                "tickvals": POLAR_TICKS_DEG,
+                "ticktext": [f"{tick:.0f} deg" for tick in POLAR_TICKS_DEG],
             },
-            "radialaxis": {"range": [PATTERN_FLOOR_DB, float(np.max(pattern_db)) + 2], "angle": 0},
+            "radialaxis": {"range": [PATTERN_FLOOR_DB, peak_db], "angle": 0},
         },
         legend={"orientation": "h", "y": -0.05},
     )
@@ -118,7 +131,10 @@ def build_channel_response_figure(
     figure = go.Figure(
         [
             go.Scatter(
-                x=frequency_megahertz, y=single_antenna_db, name="Antenna 0 alone", line={"color": NEUTRAL}
+                x=frequency_megahertz,
+                y=single_antenna_db,
+                name="One isotropic antenna",
+                line={"color": NEUTRAL},
             ),
             go.Scatter(
                 x=frequency_megahertz,
@@ -226,7 +242,7 @@ def build_ber_figure(
     )
     figure.update_layout(
         title=title,
-        xaxis_title="Per-antenna SNR before beamforming (dB)",
+        xaxis_title="SNR at one isotropic antenna, before beamforming (dB)",
         yaxis={"title": "Bit error rate", "type": "log", "range": [-5, 0]},
         height=480,
         margin=PLOT_MARGIN,

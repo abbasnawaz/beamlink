@@ -88,6 +88,7 @@ def get_ai_ranking(n_candidates: int) -> npt.NDArray[np.int64] | None:
 def get_coverage(n_antennas: int, tx_power_dbm: float, top_k: int) -> dict[str, npt.NDArray[np.float32]]:
     config, dataset = get_config(), get_dataset()
     power_db = dataset.labels.beam_power_db[n_antennas]
+    beams_per_sector = power_db.shape[1] // config.n_sectors
     budget = {
         "tx_power_dbm": tx_power_dbm,
         "bandwidth_hz": config.bandwidth_hz,
@@ -95,7 +96,7 @@ def get_coverage(n_antennas: int, tx_power_dbm: float, top_k: int) -> dict[str, 
     }
     coverage = {
         COVERAGE_VIEWS[0]: received_snr_db(power_db.max(axis=-1), **budget),
-        COVERAGE_VIEWS[3]: dataset.labels.best_beam[n_antennas].astype(np.float32),
+        COVERAGE_VIEWS[3]: (dataset.labels.best_beam[n_antennas] // beams_per_sector).astype(np.float32),
         COVERAGE_VIEWS[4]: dataset.is_los.astype(np.float32),
     }
     predictor, ranking = get_predictor(), get_ai_ranking(top_k)
@@ -139,8 +140,10 @@ def sidebar_controls(resources: AppResources) -> Controls:
     st.sidebar.header("System")
     n_antennas = st.sidebar.select_slider("BS antennas N", options=APP_ANTENNA_OPTIONS, value=base.n_antennas)
     tx_power_dbm, snr_db = None, None
-    if st.sidebar.toggle("Fixed SNR (normalised channel)", value=False):
-        snr_db = st.sidebar.slider("Per-antenna SNR (dB)", *APP_SNR_RANGE_DB, APP_DEFAULT_SNR_DB, step=1.0)
+    if st.sidebar.toggle("Fixed SNR (normalised to one isotropic antenna)", value=False):
+        snr_db = st.sidebar.slider(
+            "Isotropic-antenna SNR (dB)", *APP_SNR_RANGE_DB, APP_DEFAULT_SNR_DB, step=1.0
+        )
     else:
         tx_power_dbm = st.sidebar.slider(
             "Tx power (dBm)", *APP_TX_POWER_RANGE_DBM, base.tx_power_dbm, step=1.0
@@ -152,8 +155,14 @@ def sidebar_controls(resources: AppResources) -> Controls:
     methods = available_methods(resources, n_antennas)
     method = st.sidebar.selectbox("Beam method", methods, format_func=METHOD_LABELS.get)
     if not ai_available(resources, n_antennas) and resources.predictor is not None:
-        st.sidebar.caption(f"AI top-K needs N = {resources.predictor.norm.n_antennas}.")
-    n_beams = n_antennas * base.codebook_oversampling
+        trained_n = resources.predictor.norm.n_antennas
+        if trained_n == n_antennas:
+            st.sidebar.caption("AI predictor was trained for another codebook. Rerun offline/02 to 04.")
+        else:
+            st.sidebar.caption(
+                f"AI predictor is trained for N = {trained_n}. Select N = {trained_n} to use it."
+            )
+    n_beams = base.n_sectors * base.codebook_oversampling * n_antennas
     top_k = st.sidebar.slider("AI candidates K (beams)", 1, n_beams, min(base.predictor_top_k, n_beams))
     st.sidebar.header("Receiver")
     csi_mode = st.sidebar.radio("Channel knowledge", list(CsiMode), index=1, format_func=CSI_LABELS.get)

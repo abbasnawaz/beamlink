@@ -146,6 +146,7 @@ def log_test_metrics(
     labels: Labels,
     feature_set: FeatureSet,
     n_antennas: int,
+    n_wide_beams: int,
 ) -> None:
     test = labels.split == SPLIT_TEST
     beam_power_db = labels.beam_power_db[n_antennas][test]
@@ -158,7 +159,7 @@ def log_test_metrics(
             f"test model={model_key(feature_set, n_antennas)} n_candidates={n_candidates} "
             f"accuracy={accuracy:.3f} "
             f"mean_power_loss_db={loss_db.mean():.2f} p95_power_loss_db={np.percentile(loss_db, 95):.2f} "
-            f"beams_tested={n_candidates + n_probe_beams(feature_set)}/{beam_power_db.shape[1]}"
+            f"beams_tested={n_candidates + n_probe_beams(feature_set, n_wide_beams)}/{beam_power_db.shape[1]}"
         )
 
 
@@ -172,7 +173,7 @@ def train_all(dataset: Dataset, config: SystemConfig, seed: int) -> list[Trained
         for n_antennas in config.label_antenna_counts:
             key = model_key(feature_set, n_antennas)
             model, best_epoch = train_classifier(normalized, dataset.labels, n_antennas, config, seed)
-            log_test_metrics(model, normalized, dataset.labels, feature_set, n_antennas)
+            log_test_metrics(model, normalized, dataset.labels, feature_set, n_antennas, config.n_wide_beams)
             n_beams = dataset.labels.beam_power_db[n_antennas].shape[1]
             trained.append(
                 TrainedModel(key, feature_set, n_antennas, n_beams, mean, std, model.state_dict(), best_epoch)
@@ -204,7 +205,7 @@ def exported_norm(trained: list[TrainedModel], config: SystemConfig) -> Predicto
     return PredictorNorm(
         schema_version=NORM_SCHEMA_VERSION,
         feature_set=chosen.feature_set,
-        feature_names=feature_names(chosen.feature_set),
+        feature_names=feature_names(chosen.feature_set, config.n_wide_beams),
         feature_mean=tuple(float(value) for value in chosen.feature_mean),
         feature_std=tuple(float(value) for value in chosen.feature_std),
         n_antennas=chosen.n_antennas,

@@ -3,10 +3,13 @@ import numpy.typing as npt
 
 from beamlink.array import beam_pattern, ula_steering_vectors
 from beamlink.beamforming import (
+    beam_sector,
     beamforming_gain,
     codebook_beam_azimuths,
     dft_codebook,
     effective_channel,
+    sectored_codebook,
+    serving_sector,
     spread_over_subcarriers,
     strongest_beam_idx,
     subcarrier_mrt_weights,
@@ -111,9 +114,10 @@ def test_dft_beam_pattern_peaks_at_its_azimuth() -> None:
     for n_antennas, oversampling in ((8, 1), (8, 4), (16, 2)):
         codebook = _codebook(n_antennas, oversampling)
         azimuths = _beam_azimuths(n_antennas, oversampling)
-        patterns = beam_pattern(
-            codebook, grid, zenith=np.pi / 2, spacing_wavelengths=HALF_WAVELENGTH, boresight_azimuth=0.0
+        steering = ula_steering_vectors(
+            grid, np.pi / 2, n_antennas=n_antennas, spacing_wavelengths=HALF_WAVELENGTH, boresight_azimuth=0.0
         )
+        patterns = beam_pattern(codebook, steering)
         peaks = grid[np.argmax(patterns, axis=-1)]
         inside = np.abs(np.sin(azimuths)) < END_FIRE_COSINE
         assert np.all(np.abs(peaks[inside] - azimuths[inside]) < PEAK_TOLERANCE)
@@ -185,3 +189,36 @@ def test_strongest_beam_only_considers_candidates() -> None:
     beam_power = np.array([1.0, 9.0, 3.0, 5.0], dtype=np.float32)
     assert strongest_beam_idx(beam_power, candidate_idx=np.array([0, 2, 3])) == 3
     assert strongest_beam_idx(beam_power, candidate_idx=np.arange(4)) == 1
+
+
+def test_sectored_codebook_beams_are_unit_norm_and_live_in_their_own_sector() -> None:
+    n_antennas, n_sectors, oversampling = 8, 4, 2
+    codebook = sectored_codebook(
+        n_antennas=n_antennas,
+        n_sectors=n_sectors,
+        oversampling=oversampling,
+        spacing_wavelengths=HALF_WAVELENGTH,
+        sector=None,
+    )
+    n_beams_per_sector = oversampling * n_antennas
+    assert codebook.shape == (n_sectors * n_beams_per_sector, n_sectors * n_antennas)
+    assert np.allclose(np.linalg.norm(codebook, axis=-1), 1.0, atol=1e-6)
+    for beam_idx, weights in enumerate(codebook):
+        sector_idx, beam_in_sector = beam_sector(beam_idx, n_beams_per_sector=n_beams_per_sector)
+        own_rows = slice(sector_idx * n_antennas, (sector_idx + 1) * n_antennas)
+        assert np.count_nonzero(np.delete(weights, np.arange(n_sectors * n_antennas)[own_rows])) == 0
+        assert np.allclose(weights[own_rows], _codebook(n_antennas, oversampling)[beam_in_sector])
+        assert serving_sector(weights, n_sectors=n_sectors) == sector_idx
+
+
+def test_beam_sector_maps_global_indices_to_sector_and_local_beam() -> None:
+    assert beam_sector(0, n_beams_per_sector=8) == (0, 0)
+    assert beam_sector(13, n_beams_per_sector=8) == (1, 5)
+    assert beam_sector(31, n_beams_per_sector=8) == (3, 7)
+
+
+def test_serving_sector_of_per_subcarrier_weights_follows_the_energy() -> None:
+    weights = np.zeros((3 * 4, N_SUBCARRIERS), dtype=np.complex64)
+    weights[8:12] = 0.5
+    weights[0:4, :10] = 0.1
+    assert serving_sector(weights, n_sectors=3) == 2

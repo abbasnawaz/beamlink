@@ -14,13 +14,12 @@ from plots import (
     build_pdp_figure,
 )
 
-from beamlink.array import beam_pattern
-from beamlink.beamforming import dft_codebook
 from beamlink.channel import subcarrier_frequencies_hz
 from beamlink.config import (
     APP_DEFAULT_POSITION_XY_M,
     APP_LINK_SLOTS,
     APP_RAY_COUNT,
+    APP_STREET_AZIMUTHS,
     BeamMethod,
     CsiMode,
     Modulation,
@@ -35,7 +34,7 @@ from beamlink.data import (
     nearest_position_idx,
     position_paths,
 )
-from beamlink.link import LinkResult, run_link
+from beamlink.link import LinkResult, array_beam_pattern, run_link, system_codebook
 from beamlink.linkbudget import linear_to_db
 from beamlink.modulation import constellation
 from beamlink.predictor import BeamPredictor
@@ -69,6 +68,10 @@ class Controls:
     seed: int
 
 
+def sector_label(config: SystemConfig, sector_idx: int) -> str:
+    return f"sector {sector_idx} ({np.rad2deg(config.sector_boresight_azimuths[sector_idx]):.0f} deg)"
+
+
 def selected_position(resources: AppResources) -> int:
     if "position_idx" not in st.session_state:
         st.session_state["position_idx"] = nearest_position_idx(
@@ -78,7 +81,12 @@ def selected_position(resources: AppResources) -> int:
 
 
 def ai_available(resources: AppResources, n_antennas: int) -> bool:
-    return resources.predictor is not None and resources.predictor.norm.n_antennas == n_antennas
+    predictor, config = resources.predictor, resources.config
+    return (
+        predictor is not None
+        and predictor.norm.n_antennas == n_antennas
+        and predictor.norm.n_beams == config.n_sectors * config.codebook_oversampling * n_antennas
+    )
 
 
 def available_methods(resources: AppResources, n_antennas: int) -> list[BeamMethod]:
@@ -95,7 +103,7 @@ def simulate(
     candidates, probes = None, 0
     if method is BeamMethod.AI_TOP_K:
         candidates = resources.ai_ranking(controls.top_k)[position_idx]
-        probes = n_probe_beams(resources.predictor.norm.feature_set)
+        probes = n_probe_beams(resources.predictor.norm.feature_set, controls.config.n_wide_beams)
     return run_link(
         paths,
         controls.config,
@@ -118,16 +126,8 @@ def _display_weights(result: LinkResult) -> npt.NDArray[np.complex64]:
 
 
 def _pattern(config: SystemConfig, weights: npt.NDArray[np.complex64]) -> tuple[npt.NDArray, npt.NDArray]:
-    relative = np.linspace(-np.pi / 2, np.pi / 2, PATTERN_POINTS, dtype=np.float32)
-    azimuth = (config.bs_boresight_azimuth + relative).astype(np.float32)
-    pattern = beam_pattern(
-        weights,
-        azimuth,
-        zenith=np.pi / 2,
-        spacing_wavelengths=config.antenna_spacing_wavelengths,
-        boresight_azimuth=config.bs_boresight_azimuth,
-    )
-    return azimuth, pattern
+    azimuth = np.linspace(-np.pi, np.pi, PATTERN_POINTS, dtype=np.float32)
+    return azimuth, array_beam_pattern(weights, azimuth, np.pi / 2, config)
 
 
 def _strongest_rays(paths: ChannelPaths) -> tuple[npt.NDArray[np.float32], npt.NDArray[np.float32]]:
@@ -172,32 +172,36 @@ def _map_section(
             st.rerun()
 
 
-def _metric_cards(result: LinkResult) -> None:
-    columns = st.columns(6)
+def _metric_cards(config: SystemConfig, result: LinkResult) -> None:
+    columns = st.columns(7)
     columns[0].metric("Received SNR", f"{result.snr_db:.1f} dB")
     columns[1].metric("Beamforming gain", f"{result.beamforming_gain_db:.2f} dB")
     columns[2].metric("Bit error rate", f"{result.ber:.2e}")
     columns[3].metric("Spectral efficiency", f"{result.spectral_efficiency:.2f} bit/s/Hz")
     columns[4].metric("Beams tested", f"{result.beams_tested}")
     columns[5].metric("Power loss vs sweep", f"{result.power_loss_db:+.2f} dB")
+    columns[6].metric("Serving sector", sector_label(config, result.serving_sector))
 
 
 def _pattern_figures(controls: Controls, result: LinkResult) -> None:
     config = controls.config
     left, right = st.columns(2)
-    _, pattern = _pattern(config, _display_weights(result))
-    relative_deg = np.rad2deg(np.linspace(-np.pi / 2, np.pi / 2, PATTERN_POINTS))
+    azimuth, pattern = _pattern(config, _display_weights(result))
     codebook_db = None
     if result.method in (BeamMethod.SWEEP, BeamMethod.AI_TOP_K):
-        codebook = dft_codebook(
-            n_antennas=config.n_antennas,
-            oversampling=config.codebook_oversampling,
-            spacing_wavelengths=config.antenna_spacing_wavelengths,
-            sector=config.codebook_sector,
+        serving_rows = slice(
+            result.serving_sector * config.n_beams_per_sector,
+            (result.serving_sector + 1) * config.n_beams_per_sector,
         )
-        codebook_db = linear_to_db(_pattern(config, codebook)[1])
+        codebook_db = linear_to_db(_pattern(config, system_codebook(config)[serving_rows])[1])
     left.plotly_chart(
-        build_beam_pattern_figure(relative_deg, linear_to_db(pattern), codebook_db, result.method)
+        build_beam_pattern_figure(
+            np.rad2deg(azimuth),
+            linear_to_db(pattern),
+            codebook_db,
+            result.method,
+            np.rad2deg(np.asarray(APP_STREET_AZIMUTHS)),
+        )
     )
     ideal = constellation(controls.modulation)
     right.plotly_chart(
@@ -245,6 +249,7 @@ def _comparison_table(
                 "BER": f"{result.ber:.2e}",
                 "Spectral eff. (bit/s/Hz)": round(result.spectral_efficiency, 2),
                 "Beams tested": result.beams_tested,
+                "Serving sector": sector_label(controls.config, result.serving_sector),
                 "Loss vs sweep (dB)": round(result.power_loss_db, 2),
             }
         )
@@ -259,9 +264,12 @@ def render_link_tab(resources: AppResources, controls: Controls) -> None:
     result = simulate(resources, paths, controls, controls.method, position_idx)
     region = "LOS" if dataset.is_los[position_idx] else "NLOS"
     location = dataset.positions_m[position_idx]
-    st.markdown(f"**UE #{position_idx}** at ({location[0]:.1f}, {location[1]:.1f}) m, {region}")
+    st.markdown(
+        f"**UE #{position_idx}** at ({location[0]:.1f}, {location[1]:.1f}) m, {region}, "
+        f"served by {sector_label(controls.config, result.serving_sector)}"
+    )
     _map_section(resources, controls, result, paths, position_idx)
-    _metric_cards(result)
+    _metric_cards(controls.config, result)
     _pattern_figures(controls, result)
     _channel_figures(controls, result)
     _comparison_table(resources, controls, paths, position_idx)

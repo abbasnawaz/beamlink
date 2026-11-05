@@ -7,8 +7,16 @@ from link_tab import MODULATION_LABELS, AppResources, Controls, available_method
 from map_plots import build_coverage_figure, categorical_colorscale
 from plots import CATEGORICAL, build_ber_figure
 
-from beamlink.config import APP_BER_SLOTS, APP_BER_SNR_DB, BeamMethod, CsiMode, Modulation, SimulationMode
-from beamlink.data import position_paths
+from beamlink.config import (
+    APP_BER_SLOTS,
+    APP_BER_SNR_DB,
+    MIN_SERVICE_SNR_DB,
+    BeamMethod,
+    CsiMode,
+    Modulation,
+    SimulationMode,
+)
+from beamlink.data import labels_match_config, position_paths
 from beamlink.linkbudget import db_to_linear
 from beamlink.metrics import awgn_ber_theory
 
@@ -16,9 +24,32 @@ COVERAGE_VIEWS = (
     "Received SNR, sweep",
     "Received SNR, AI top-K",
     "AI power loss vs sweep",
-    "Best sweep beam",
+    "Serving sector, sweep",
     "LOS / NLOS",
 )
+SNR_VIEWS = COVERAGE_VIEWS[:2]
+NO_SERVICE_LABEL = f"No service (SNR < {MIN_SERVICE_SNR_DB:.0f} dB)"
+WHY_FOUR_SECTORS = """
+The first version used one ULA with isotropic elements, with its axis along the street. A ULA only sees the
+phase step between neighbouring elements, which depends only on the angle to its axis, so two directions that
+are mirror images about the axis look identical. Along the axis (end-fire), with half-wavelength spacing, the
+phase step is +pi one way and -pi the other, which is the same thing: a beam aimed down the street at +x also
+fires down -x. Most users sit along the street, so the old array wasted much of its energy.
+
+Real base stations use directional elements and sectors, and so does this one: four panels facing the four
+street directions, tilted 10 deg down, each with TR 38.901 elements (8 dBi, 65 deg beamwidth, 30 dB
+front-to-back). Each panel only hears its own half-plane, so the mirror ambiguity no longer matters.
+
+| N = 8, 30 dBm | v1: single ULA | v2: four sectors |
+|---|---|---|
+| Median SNR, LOS / NLOS | 37.2 / 12.0 dB | 43.7 / 17.9 dB |
+| Positions without service | 23.5% | 19.7% |
+| Positions whose best beam is the most-used beam | 36.6% (beam 0) | 7.8% |
+| Sweep gain at (30, 0), against nominal | 7.4 of 9.0 dB | 17.8 of 17.0 dB |
+| AI: beams measured, top-K accuracy | 3 / 8, 97.6% | 10 / 64, 97.6% |
+
+Only 0.3% of positions lose more than 1 dB: users right under the mast, who still have about 43 dB.
+"""
 PIPELINE_DOT = """
 digraph pipeline {
   rankdir=LR;
@@ -32,14 +63,19 @@ digraph pipeline {
 """
 
 
-def _coverage_style(view: str, values: np.ndarray, n_beams: int) -> tuple[str, object, tuple[float, float]]:
-    if view in COVERAGE_VIEWS[:2]:
-        low, high = np.percentile(values, (1, 99))
-        return "SNR (dB)", "Blues", (float(low), float(high))
+def _coverage_style(
+    view: str, values: np.ndarray, n_categories: int
+) -> tuple[str, object, tuple[float, float]]:
+    if view in SNR_VIEWS:
+        served = values[values >= MIN_SERVICE_SNR_DB]
+        low, high = (
+            np.percentile(served, (1, 99)) if served.size else (MIN_SERVICE_SNR_DB, MIN_SERVICE_SNR_DB + 1)
+        )
+        return "SNR (dB)", "Blues", (max(float(low), MIN_SERVICE_SNR_DB), float(high))
     if view == COVERAGE_VIEWS[2]:
         return "loss (dB)", "Oranges", (0.0, max(1.0, float(np.percentile(values, 99.9))))
     if view == COVERAGE_VIEWS[3]:
-        return "beam index", categorical_colorscale(n_beams), (-0.5, n_beams - 0.5)
+        return "sector", categorical_colorscale(n_categories), (-0.5, n_categories - 0.5)
     return "1 = LOS", [[0.0, CATEGORICAL[1]], [1.0, CATEGORICAL[0]]], (0.0, 1.0)
 
 
@@ -51,15 +87,20 @@ def render_coverage_tab(resources: AppResources, controls: Controls) -> None:
             f"Coverage maps are precomputed for N in {sorted(labels.beam_power_db)}. Change N in the sidebar."
         )
         return
+    if (
+        not labels_match_config(labels, controls.config)
+        or labels.beam_power_db[n_antennas].shape[1] != controls.config.n_beams
+    ):
+        st.info("Coverage labels were built for a different codebook. Run offline/02_build_labels.py.")
+        return
     tx_power_dbm = (
         controls.tx_power_dbm if controls.tx_power_dbm is not None else resources.config.tx_power_dbm
     )
     coverage = resources.coverage(n_antennas, tx_power_dbm, controls.top_k)
     view = st.radio("Map", [name for name in COVERAGE_VIEWS if name in coverage], horizontal=True)
-    colorbar_title, colorscale, value_range = _coverage_style(
-        view, coverage[view], labels.beam_power_db[n_antennas].shape[1]
-    )
+    colorbar_title, colorscale, value_range = _coverage_style(view, coverage[view], controls.config.n_sectors)
     meta = resources.meta
+    no_service = coverage[view] < MIN_SERVICE_SNR_DB if view in SNR_VIEWS else None
     figure = build_coverage_figure(
         image_png=resources.scene_image,
         image_extent_m=meta.image_extent_m,
@@ -72,8 +113,16 @@ def render_coverage_tab(resources: AppResources, controls: Controls) -> None:
         colorbar_title=colorbar_title,
         colorscale=colorscale,
         value_range=value_range,
+        no_service=no_service,
+        no_service_label=NO_SERVICE_LABEL,
     )
     st.plotly_chart(figure, width="stretch")
+    snr_view = view if view in SNR_VIEWS else COVERAGE_VIEWS[0]
+    unserved_percent = 100.0 * float(np.mean(coverage[snr_view] < MIN_SERVICE_SNR_DB))
+    st.caption(
+        f"{unserved_percent:.1f}% of positions have no service (SNR < {MIN_SERVICE_SNR_DB:.0f} dB) "
+        f"at {tx_power_dbm:.0f} dBm with {snr_view.split(', ')[1]} beam selection."
+    )
 
 
 @st.cache_data(show_spinner="Running Monte-Carlo BER...")
@@ -135,13 +184,20 @@ def render_ber_tab(resources: AppResources, controls: Controls) -> None:
     )
     st.plotly_chart(figure, width="stretch")
     st.caption(
-        "Fixed-SNR mode: the channel is scaled to unit average power per antenna, so the gap between "
-        "the curves and the AWGN line is the beamforming gain minus the cost of frequency-selective fading."
+        "Fixed-SNR mode: the channel is scaled so one isotropic antenna receives unit power, so the gap "
+        "between the curves and the AWGN line is the beamforming gain (element plus array) minus the cost "
+        "of frequency-selective fading."
     )
 
 
 def render_about_tab(resources: AppResources) -> None:
-    dataset, meta, predictor = resources.dataset, resources.meta, resources.predictor
+    dataset, meta, predictor, config = (
+        resources.dataset,
+        resources.meta,
+        resources.predictor,
+        resources.config,
+    )
+    boresights_deg = ", ".join(f"{np.rad2deg(azimuth):.0f}" for azimuth in config.sector_boresight_azimuths)
     st.subheader("Pipeline")
     st.graphviz_chart(PIPELINE_DOT)
     st.subheader("Dataset")
@@ -151,7 +207,11 @@ def render_about_tab(resources: AppResources) -> None:
         f"- {dataset.positions_m.shape[0]} UE positions on a {meta.grid_spacing_m} m grid, "
         f"{int(dataset.is_los.sum())} with line of sight\n"
         f"- BS at ({meta.bs_position_m[0]:.1f}, {meta.bs_position_m[1]:.1f}, {meta.bs_position_m[2]:.1f}) m, "
-        f"ULA facing {np.rad2deg(meta.bs_boresight_azimuth):.0f} deg azimuth"
+        f"{config.n_sectors} sectors facing {boresights_deg} deg azimuth, "
+        f"{np.rad2deg(config.sector_downtilt):.0f} deg downtilt, {config.n_antennas} elements per sector "
+        f"with a {config.element_peak_gain_dbi:.0f} dBi TR 38.901 pattern\n"
+        "- Beamforming gain is measured against one isotropic antenna at the BS, so it includes the "
+        "element gain as well as the array gain"
     )
     if predictor is not None:
         top_k = resources.config.predictor_top_k
@@ -164,10 +224,13 @@ def render_about_tab(resources: AppResources) -> None:
         card = resources.model_card(top_k)
         table = pd.DataFrame({"Metric": list(card), "Value": [round(value, 3) for value in card.values()]})
         st.dataframe(table, hide_index=True)
+    st.subheader("Why four sectors")
+    st.markdown(WHY_FOUR_SECTORS)
     st.subheader("Limitations")
     st.markdown(
         "- Static channel within a slot, single user, single BS.\n"
         "- One ray-traced scene, so the model has learned this street and not streets in general.\n"
-        "- Isotropic antennas, vertical polarisation, and no measurement noise in the beam sweep.\n"
+        "- Scalar TR 38.901 pattern (the polarization rotation of a tilted panel is ignored), vertical "
+        "polarisation, and no measurement noise in the beam sweep.\n"
         "- Free Streamlit apps sleep when idle; the first load after a pause takes a few seconds."
     )

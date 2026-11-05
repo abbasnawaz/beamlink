@@ -10,6 +10,7 @@ from beamlink.config import BeamMethod
 LOBE_LENGTH_M = 45.0
 RAY_LENGTH_M = 35.0
 MAP_MARKER_SIZE = 5
+NO_SERVICE_COLOR = "#8c8b85"
 
 
 def _image_uri(image_png: bytes) -> str:
@@ -43,8 +44,8 @@ def _scene_layout(
     )
 
 
-def _bs_marker(bs_position_m: tuple[float, ...]) -> go.Scatter:
-    return go.Scatter(
+def _bs_marker(bs_position_m: tuple[float, ...]) -> go.Scattergl:
+    return go.Scattergl(
         x=[bs_position_m[0]],
         y=[bs_position_m[1]],
         mode="markers",
@@ -154,29 +155,45 @@ def build_coverage_figure(
     colorbar_title: str,
     colorscale: str | list[list[object]],
     value_range: tuple[float, float],
+    no_service: npt.NDArray[np.bool_] | None = None,
+    no_service_label: str = "",
 ) -> go.Figure:
+    position_idx = np.arange(positions_m.shape[0])
+    served = np.ones(positions_m.shape[0], dtype=np.bool_) if no_service is None else ~no_service
     figure = go.Figure(
         go.Scattergl(
-            x=positions_m[:, 0],
-            y=positions_m[:, 1],
+            x=positions_m[served, 0],
+            y=positions_m[served, 1],
             mode="markers",
             marker={
                 "size": MAP_MARKER_SIZE + 1,
                 "symbol": "square",
-                "color": values,
+                "color": values[served],
                 "colorscale": colorscale,
                 "cmin": value_range[0],
                 "cmax": value_range[1],
                 "colorbar": {"title": colorbar_title},
             },
-            customdata=np.stack([np.arange(positions_m.shape[0]), values], axis=-1),
+            customdata=np.stack([position_idx[served], values[served]], axis=-1),
             hovertemplate="UE #%{customdata[0]}<br>%{customdata[1]:.2f}<extra></extra>",
             showlegend=False,
         )
     )
+    if no_service is not None:
+        figure.add_trace(
+            go.Scattergl(
+                x=positions_m[no_service, 0],
+                y=positions_m[no_service, 1],
+                mode="markers",
+                marker={"size": MAP_MARKER_SIZE + 1, "symbol": "square", "color": NO_SERVICE_COLOR},
+                customdata=np.stack([position_idx[no_service], values[no_service]], axis=-1),
+                hovertemplate="UE #%{customdata[0]}<br>%{customdata[1]:.2f} (no service)<extra></extra>",
+                name=no_service_label,
+            )
+        )
     selected = positions_m[selected_idx]
     figure.add_trace(
-        go.Scatter(
+        go.Scattergl(
             x=[selected[0]],
             y=[selected[1]],
             mode="markers",

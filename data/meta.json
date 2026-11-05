@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "scene_name": "simple_street_canyon",
   "carrier_frequency_hz": 28000000000.0,
   "bs_position_m": [
@@ -7,7 +7,6 @@
     -7.6,
     12.0
   ],
-  "bs_boresight_azimuth": 1.5707963267948966,
   "grid_extent_m": [
     -90.0,
     90.0,

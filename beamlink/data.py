@@ -12,9 +12,10 @@ from beamlink.config import (
     DATASET_FILENAME,
     DATASET_SCHEMA_VERSION,
     META_FILENAME,
-    N_WIDE_BEAMS,
     SCENE_IMAGE_FILENAME,
+    WIDE_BEAM_ELEMENTS,
     FeatureSet,
+    SystemConfig,
 )
 from beamlink.exceptions import ArtifactError
 
@@ -45,6 +46,8 @@ class Labels:
     best_beam: dict[int, npt.NDArray[np.int16]]
     wide_beam_power_db: npt.NDArray[np.float32]
     split: npt.NDArray[np.int8]
+    sector_boresight_azimuths: npt.NDArray[np.float32]
+    sector_downtilt: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,7 +64,6 @@ class SceneMeta:
     scene_name: str
     carrier_frequency_hz: float
     bs_position_m: tuple[float, ...]
-    bs_boresight_azimuth: float
     grid_extent_m: tuple[float, ...]
     grid_spacing_m: float
     image_extent_m: tuple[float, ...]
@@ -134,6 +136,8 @@ def _label_arrays(labels: Labels | None) -> dict[str, npt.NDArray[np.generic]]:
     arrays: dict[str, npt.NDArray[np.generic]] = {
         "wide_beam_power_db": labels.wide_beam_power_db.astype(np.float32),
         "split": labels.split.astype(np.int8),
+        "sector_boresight_azimuths": labels.sector_boresight_azimuths.astype(np.float32),
+        "sector_downtilt": np.array([labels.sector_downtilt], dtype=np.float32),
     }
     for n_antennas, beam_power_db in labels.beam_power_db.items():
         arrays[f"beam_power_db_n{n_antennas}"] = beam_power_db.astype(np.float32)
@@ -191,10 +195,21 @@ def _labels_from_arrays(
         return None
     if not antenna_counts:
         raise ArtifactError(str(path), "labels present but no beam_power_db_n{N} key")
+    if "sector_boresight_azimuths" not in arrays or arrays["sector_boresight_azimuths"].ndim != 1:
+        raise ArtifactError(str(path), "sector_boresight_azimuths must exist with shape (n_sectors,)")
+    n_sectors = arrays["sector_boresight_azimuths"].shape[0]
+    sector_boresight_azimuths = _require_array(
+        arrays, path, "sector_boresight_azimuths", np.float32, (n_sectors,)
+    )
+    sector_downtilt = _require_array(arrays, path, "sector_downtilt", np.float32, (1,))
     beam_power_db, best_beam = {}, {}
     for n_antennas in antenna_counts:
         power_key = f"beam_power_db_n{n_antennas}"
         n_beams = arrays[power_key].shape[-1] if arrays[power_key].ndim == 2 else 0
+        if n_beams == 0 or n_beams % (n_sectors * n_antennas) != 0:
+            raise ArtifactError(
+                str(path), f"{power_key} needs a multiple of {n_sectors} sectors x {n_antennas} beams"
+            )
         beam_power_db[n_antennas] = _require_array(
             arrays, path, power_key, np.float32, (n_positions, n_beams)
         )
@@ -205,9 +220,19 @@ def _labels_from_arrays(
         beam_power_db=beam_power_db,
         best_beam=best_beam,
         wide_beam_power_db=_require_array(
-            arrays, path, "wide_beam_power_db", np.float32, (n_positions, N_WIDE_BEAMS)
+            arrays, path, "wide_beam_power_db", np.float32, (n_positions, n_sectors * WIDE_BEAM_ELEMENTS)
         ),
         split=_require_array(arrays, path, "split", np.int8, (n_positions,)),
+        sector_boresight_azimuths=sector_boresight_azimuths,
+        sector_downtilt=float(sector_downtilt[0]),
+    )
+
+
+def labels_match_config(labels: Labels, config: SystemConfig) -> bool:
+    return (
+        labels.sector_boresight_azimuths.shape == (config.n_sectors,)
+        and np.allclose(labels.sector_boresight_azimuths, config.sector_boresight_azimuths, atol=1e-6)
+        and np.isclose(labels.sector_downtilt, config.sector_downtilt, atol=1e-6)
     )
 
 
@@ -237,7 +262,6 @@ def meta_from_document(document: dict[str, object], path: Path) -> SceneMeta:
         scene_name=str(document["scene_name"]),
         carrier_frequency_hz=float(document["carrier_frequency_hz"]),
         bs_position_m=tuple(float(value) for value in document["bs_position_m"]),
-        bs_boresight_azimuth=float(document["bs_boresight_azimuth"]),
         grid_extent_m=tuple(float(value) for value in document["grid_extent_m"]),
         grid_spacing_m=float(document["grid_spacing_m"]),
         image_extent_m=tuple(float(value) for value in document["image_extent_m"]),
@@ -261,11 +285,11 @@ def load_meta(data_dir: Path) -> SceneMeta:
     return meta
 
 
-def feature_names(feature_set: FeatureSet) -> tuple[str, ...]:
+def feature_names(feature_set: FeatureSet, n_wide_beams: int) -> tuple[str, ...]:
     position = ("position_x_m", "position_y_m")
     if feature_set is FeatureSet.POSITION:
         return position
-    return position + tuple(f"wide_beam_{beam_idx}_power_db" for beam_idx in range(N_WIDE_BEAMS))
+    return position + tuple(f"wide_beam_{beam_idx}_power_db" for beam_idx in range(n_wide_beams))
 
 
 def predictor_features(dataset: Dataset, feature_set: FeatureSet) -> npt.NDArray[np.float32]:
@@ -279,8 +303,8 @@ def predictor_features(dataset: Dataset, feature_set: FeatureSet) -> npt.NDArray
     return np.concatenate([position, dataset.labels.wide_beam_power_db], axis=-1).astype(np.float32)
 
 
-def n_probe_beams(feature_set: FeatureSet) -> int:
-    return N_WIDE_BEAMS if feature_set is FeatureSet.POSITION_WIDE_BEAMS else 0
+def n_probe_beams(feature_set: FeatureSet, n_wide_beams: int) -> int:
+    return n_wide_beams if feature_set is FeatureSet.POSITION_WIDE_BEAMS else 0
 
 
 def nearest_position_idx(positions_m: npt.NDArray[np.float32], x_m: float, y_m: float) -> int:

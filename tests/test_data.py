@@ -5,7 +5,14 @@ import numpy as np
 import numpy.typing as npt
 import pytest
 
-from beamlink.config import DATASET_FILENAME, DATASET_SCHEMA_VERSION, META_FILENAME, N_WIDE_BEAMS, FeatureSet
+from beamlink.config import (
+    DATASET_FILENAME,
+    DATASET_SCHEMA_VERSION,
+    META_FILENAME,
+    WIDE_BEAM_ELEMENTS,
+    FeatureSet,
+    load_config,
+)
 from beamlink.data import (
     ChannelPaths,
     Dataset,
@@ -13,6 +20,7 @@ from beamlink.data import (
     SceneMeta,
     dataset_arrays,
     feature_names,
+    labels_match_config,
     load_dataset,
     load_meta,
     meta_document,
@@ -25,6 +33,10 @@ from beamlink.exceptions import ArtifactError
 N_POSITIONS = 5
 N_PATHS = 4
 LABEL_ANTENNA_COUNTS = (8, 16)
+SECTOR_BORESIGHTS = (0.0, np.pi / 2, np.pi, 3 * np.pi / 2)
+N_SECTORS = len(SECTOR_BORESIGHTS)
+N_WIDE_BEAMS = N_SECTORS * WIDE_BEAM_ELEMENTS
+CONFIG_PATH = Path(__file__).resolve().parents[1] / "configs" / "default.yaml"
 
 
 def _dataset(seed: int) -> Dataset:
@@ -51,7 +63,6 @@ def _meta() -> SceneMeta:
         scene_name="simple_street_canyon",
         carrier_frequency_hz=28e9,
         bs_position_m=(0.0, -7.6, 12.0),
-        bs_boresight_azimuth=np.pi / 2,
         grid_extent_m=(-90.0, 90.0, -58.0, 58.0),
         grid_spacing_m=1.5,
         image_extent_m=(-100.0, 100.0, -65.0, 65.0),
@@ -138,7 +149,7 @@ def _labelled(seed: int) -> Dataset:
     rng = np.random.default_rng(seed)
     base = _dataset(seed)
     power = {
-        count: rng.uniform(-150, -80, (N_POSITIONS, count)).astype(np.float32)
+        count: rng.uniform(-150, -80, (N_POSITIONS, N_SECTORS * count)).astype(np.float32)
         for count in LABEL_ANTENNA_COUNTS
     }
     labels = Labels(
@@ -148,6 +159,8 @@ def _labelled(seed: int) -> Dataset:
         },
         wide_beam_power_db=rng.uniform(-150, -80, (N_POSITIONS, N_WIDE_BEAMS)).astype(np.float32),
         split=rng.integers(0, 3, N_POSITIONS).astype(np.int8),
+        sector_boresight_azimuths=np.asarray(SECTOR_BORESIGHTS, dtype=np.float32),
+        sector_downtilt=float(np.float32(np.deg2rad(10.0))),
     )
     return Dataset(positions_m=base.positions_m, paths=base.paths, is_los=base.is_los, labels=labels)
 
@@ -162,6 +175,8 @@ def test_labels_round_trip(tmp_path: Path) -> None:
         assert np.array_equal(loaded.labels.beam_power_db[count], original.labels.beam_power_db[count])
         assert loaded.labels.best_beam[count].dtype == np.int16
     assert np.array_equal(loaded.labels.split, original.labels.split)
+    assert np.array_equal(loaded.labels.sector_boresight_azimuths, original.labels.sector_boresight_azimuths)
+    assert loaded.labels.sector_downtilt == pytest.approx(original.labels.sector_downtilt)
 
 
 def test_unlabelled_dataset_loads_without_labels(tmp_path: Path) -> None:
@@ -181,12 +196,35 @@ def test_predictor_features_follow_the_feature_set() -> None:
     dataset = _labelled(8)
     for feature_set in FeatureSet:
         features = predictor_features(dataset, feature_set)
-        assert features.shape == (N_POSITIONS, len(feature_names(feature_set)))
+        assert features.shape == (N_POSITIONS, len(feature_names(feature_set, N_WIDE_BEAMS)))
         assert features.dtype == np.float32
-    assert n_probe_beams(FeatureSet.POSITION) == 0
-    assert n_probe_beams(FeatureSet.POSITION_WIDE_BEAMS) == N_WIDE_BEAMS
+    assert n_probe_beams(FeatureSet.POSITION, N_WIDE_BEAMS) == 0
+    assert n_probe_beams(FeatureSet.POSITION_WIDE_BEAMS, N_WIDE_BEAMS) == N_WIDE_BEAMS
 
 
 def test_wide_beam_features_need_labels() -> None:
     with pytest.raises(ArtifactError, match="labels"):
         predictor_features(_dataset(9), FeatureSet.POSITION_WIDE_BEAMS)
+
+
+def test_beam_count_that_does_not_fit_the_sectors_is_rejected(tmp_path: Path) -> None:
+    arrays = dataset_arrays(_labelled(10))
+    arrays["beam_power_db_n8"] = arrays["beam_power_db_n8"][:, :-1]
+    _write_arrays(tmp_path, arrays)
+    with pytest.raises(ArtifactError, match="beam_power_db_n8"):
+        load_dataset(tmp_path)
+
+
+def test_labels_from_another_sector_layout_do_not_match_the_config() -> None:
+    labels = _labelled(11).labels
+    config = load_config(CONFIG_PATH)
+    assert labels_match_config(labels, config)
+    rotated = Labels(
+        beam_power_db=labels.beam_power_db,
+        best_beam=labels.best_beam,
+        wide_beam_power_db=labels.wide_beam_power_db,
+        split=labels.split,
+        sector_boresight_azimuths=labels.sector_boresight_azimuths + np.float32(0.1),
+        sector_downtilt=labels.sector_downtilt,
+    )
+    assert not labels_match_config(rotated, config)

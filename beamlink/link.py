@@ -3,12 +3,13 @@ from dataclasses import dataclass
 import numpy as np
 import numpy.typing as npt
 
-from beamlink.array import ula_steering_vectors
+from beamlink.array import beam_pattern, sectored_array_response
 from beamlink.beamforming import (
     beamforming_gain,
-    dft_codebook,
     effective_channel,
     precode_grid,
+    sectored_codebook,
+    serving_sector,
     spread_over_subcarriers,
     strongest_beam_idx,
     subcarrier_mrt_weights,
@@ -61,6 +62,7 @@ FloatArray = npt.NDArray[np.float32]
 class LinkResult:
     method: BeamMethod
     beam_idx: int | None
+    serving_sector: int
     beams_tested: int
     beam_weights: ComplexArray
     snr_db: float
@@ -85,6 +87,7 @@ class _Channel:
     cfr: ComplexArray
     cir: ComplexArray | None
     cfr_seen_by_ofdm: ComplexArray
+    isotropic_cfr: ComplexArray
 
 
 @dataclass(frozen=True, slots=True)
@@ -140,24 +143,52 @@ def _validate_paths(paths: ChannelPaths) -> None:
             raise ShapeError(name, expected, actual)
 
 
+def array_response(
+    azimuth: FloatArray | float, zenith: FloatArray | float, config: SystemConfig
+) -> ComplexArray:
+    return sectored_array_response(
+        azimuth,
+        zenith,
+        n_antennas=config.n_antennas,
+        spacing_wavelengths=config.antenna_spacing_wavelengths,
+        sector_boresight_azimuths=config.sector_boresight_azimuths,
+        downtilt=config.sector_downtilt,
+        peak_gain_dbi=config.element_peak_gain_dbi,
+        beamwidth=config.element_beamwidth,
+        front_to_back_db=config.element_front_to_back_db,
+    )
+
+
+def array_beam_pattern(
+    beam_weights: ComplexArray, azimuth: FloatArray, zenith: FloatArray | float, config: SystemConfig
+) -> FloatArray:
+    return beam_pattern(beam_weights, array_response(azimuth, zenith, config))
+
+
+def system_codebook(config: SystemConfig) -> ComplexArray:
+    return sectored_codebook(
+        n_antennas=config.n_antennas,
+        n_sectors=config.n_sectors,
+        oversampling=config.codebook_oversampling,
+        spacing_wavelengths=config.antenna_spacing_wavelengths,
+        sector=config.codebook_sector,
+    )
+
+
 def _build_channel(
     paths: ChannelPaths, config: SystemConfig, simulation_mode: SimulationMode, normalize: bool
 ) -> _Channel:
     delay_s = time_aligned_delays(paths.path_delay_s, paths.path_valid)
     gain = np.where(paths.path_valid, paths.path_gain, 0.0).astype(np.complex64)
-    steering = ula_steering_vectors(
-        paths.path_azimuth,
-        paths.path_zenith,
-        n_antennas=config.n_antennas,
-        spacing_wavelengths=config.antenna_spacing_wavelengths,
-        boresight_azimuth=config.bs_boresight_azimuth,
-    )
+    steering = array_response(paths.path_azimuth, paths.path_zenith, config)
+    isotropic = np.ones((1, gain.shape[-1]), dtype=np.complex64)
     grid_axes = {"n_subcarriers": config.n_subcarriers, "subcarrier_spacing_hz": config.subcarrier_spacing_hz}
     if normalize:
-        gain = unit_power_gain(gain, paths_to_cfr(gain, delay_s, steering, **grid_axes))
+        gain = unit_power_gain(gain, paths_to_cfr(gain, delay_s, isotropic, **grid_axes))
+    isotropic_cfr = paths_to_cfr(gain, delay_s, isotropic, **grid_axes)
     cfr = paths_to_cfr(gain, delay_s, steering, **grid_axes)
     if simulation_mode is SimulationMode.FREQUENCY:
-        return _Channel(gain, delay_s, cfr, None, cfr)
+        return _Channel(gain, delay_s, cfr, None, cfr, isotropic_cfr)
     n_taps = n_cir_taps(
         delay_s,
         sample_rate_hz=config.sample_rate_hz,
@@ -172,7 +203,9 @@ def _build_channel(
         n_precursor_taps=config.n_cir_precursor_taps,
         n_taps=n_taps,
     )
-    return _Channel(gain, delay_s, cfr, cir, cir_to_cfr(cir, n_subcarriers=config.n_subcarriers))
+    return _Channel(
+        gain, delay_s, cfr, cir, cir_to_cfr(cir, n_subcarriers=config.n_subcarriers), isotropic_cfr
+    )
 
 
 def _select_beam(
@@ -279,12 +312,7 @@ def run_link(
     noise_variance = _noise_variance(config, snr_db, tx_power_dbm)
     rng = np.random.default_rng(seed)
     channel = _build_channel(paths, config, simulation_mode, normalize=snr_db is not None)
-    codebook = dft_codebook(
-        n_antennas=config.n_antennas,
-        oversampling=config.codebook_oversampling,
-        spacing_wavelengths=config.antenna_spacing_wavelengths,
-        sector=config.codebook_sector,
-    )
+    codebook = system_codebook(config)
     beam_power = sweep_beams(channel.cfr, codebook)
     selection = _select_beam(channel.cfr, codebook, beam_power, method, candidate_beams, n_probe_beams)
     h_eff_true = effective_channel(channel.cfr_seen_by_ofdm, selection.subcarrier_weights)
@@ -304,10 +332,11 @@ def run_link(
     return LinkResult(
         method=method,
         beam_idx=selection.beam_idx,
+        serving_sector=serving_sector(selection.beam_weights, n_sectors=config.n_sectors),
         beams_tested=selection.beams_tested,
         beam_weights=selection.beam_weights,
         snr_db=float(linear_to_db(snr)),
-        beamforming_gain_db=float(linear_to_db(beamforming_gain(chosen_power, channel.cfr))),
+        beamforming_gain_db=float(linear_to_db(beamforming_gain(chosen_power, channel.isotropic_cfr))),
         ber=bit_error_rate(transmission.bits, received_bits),
         n_bits=int(transmission.bits.size),
         spectral_efficiency=spectral_efficiency(snr),
@@ -318,5 +347,5 @@ def run_link(
         symbols_after_equalization=_plotted(equalized_symbols),
         pdp_delay_s=pdp_delay_s,
         pdp=pdp,
-        cfr_reference_antenna=channel.cfr_seen_by_ofdm[0],
+        cfr_reference_antenna=channel.isotropic_cfr[0],
     )

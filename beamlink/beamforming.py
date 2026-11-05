@@ -57,6 +57,34 @@ def dft_codebook(
     return (np.conj(response).T / np.sqrt(np.float32(n_antennas))).astype(np.complex64)
 
 
+def sectored_codebook(
+    *,
+    n_antennas: int,
+    n_sectors: int,
+    oversampling: int,
+    spacing_wavelengths: float,
+    sector: tuple[float, ...] | None,
+) -> ComplexArray:
+    panel_codebook = dft_codebook(
+        n_antennas=n_antennas,
+        oversampling=oversampling,
+        spacing_wavelengths=spacing_wavelengths,
+        sector=sector,
+    )
+    return np.kron(np.eye(n_sectors, dtype=np.complex64), panel_codebook).astype(np.complex64)
+
+
+def beam_sector(beam_idx: int, *, n_beams_per_sector: int) -> tuple[int, int]:
+    sector_idx, beam_in_sector = divmod(int(beam_idx), n_beams_per_sector)
+    return sector_idx, beam_in_sector
+
+
+def serving_sector(beam_weights: ComplexArray, *, n_sectors: int) -> int:
+    per_sector = beam_weights.reshape(n_sectors, -1, *beam_weights.shape[1:])
+    energy = np.sum(np.abs(per_sector) ** 2, axis=tuple(range(1, per_sector.ndim)))
+    return int(np.argmax(energy))
+
+
 def spread_over_subcarriers(beam_weights: ComplexArray, *, n_subcarriers: int) -> ComplexArray:
     return np.repeat(beam_weights[..., np.newaxis], n_subcarriers, axis=-1)
 

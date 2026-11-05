@@ -13,20 +13,24 @@ from beamlink.exceptions import ConfigError
 SPEED_OF_LIGHT_M_PER_S = 299_792_458.0
 THERMAL_NOISE_DBM_PER_HZ = -174.0
 DBM_PER_DBW = 30.0
+MIN_SERVICE_SNR_DB = 0.0
+ELEMENT_ROLLOFF_DB = 12.0
 
 MAX_PLOTTED_SYMBOLS = 2000
 
 DATASET_FILENAME = "dataset.npz"
 META_FILENAME = "meta.json"
 SCENE_IMAGE_FILENAME = "scene_topdown.png"
-DATASET_SCHEMA_VERSION = 1
+DATASET_SCHEMA_VERSION = 2
 
 TOPDOWN_HALF_WIDTH_M = 100.0
 TOPDOWN_RESOLUTION_PX = (1200, 780)
 
 SIONNA_CFR_TOLERANCE = 1e-2
+SIONNA_TILTED_CFR_TOLERANCE = 3e-2
+RT_TRACE_YAW = math.pi / 2.0
 
-N_WIDE_BEAMS = 4
+WIDE_BEAM_ELEMENTS = 2
 SPLIT_TRAIN = 0
 SPLIT_VALIDATION = 1
 SPLIT_TEST = 2
@@ -51,7 +55,8 @@ APP_BER_SLOTS = 3
 APP_LINK_SLOTS = 1
 APP_RAY_COUNT = 5
 APP_DEFAULT_SEED = 0
-APP_DEFAULT_POSITION_XY_M = (30.0, 0.0)
+APP_DEFAULT_POSITION_XY_M = (61.5, 54.5)
+APP_STREET_AZIMUTHS = (0.0, math.pi)
 
 SYNTHETIC_N_PATHS = 8
 SYNTHETIC_MAX_DELAY_S = 300e-9
@@ -109,7 +114,11 @@ class SystemConfig:
     pilot_seed: int
     n_antennas: int
     antenna_spacing_wavelengths: float
-    bs_boresight_azimuth: float
+    sector_boresight_azimuths: tuple[float, ...]
+    sector_downtilt: float
+    element_peak_gain_dbi: float
+    element_beamwidth: float
+    element_front_to_back_db: float
     codebook_oversampling: int
     codebook_sector: tuple[float, ...] | None
     n_cir_precursor_taps: int
@@ -142,6 +151,22 @@ class SystemConfig:
     predictor_top_k: int
 
     @property
+    def n_sectors(self) -> int:
+        return len(self.sector_boresight_azimuths)
+
+    @property
+    def n_beams_per_sector(self) -> int:
+        return self.codebook_oversampling * self.n_antennas
+
+    @property
+    def n_beams(self) -> int:
+        return self.n_sectors * self.n_beams_per_sector
+
+    @property
+    def n_wide_beams(self) -> int:
+        return self.n_sectors * WIDE_BEAM_ELEMENTS
+
+    @property
     def wavelength_m(self) -> float:
         return SPEED_OF_LIGHT_M_PER_S / self.carrier_frequency_hz
 
@@ -152,6 +177,16 @@ class SystemConfig:
     @property
     def bandwidth_hz(self) -> float:
         return self.n_subcarriers * self.subcarrier_spacing_hz
+
+
+def single_isotropic_panel(config: SystemConfig, *, boresight_azimuth: float = 0.0) -> SystemConfig:
+    return dataclasses.replace(
+        config,
+        sector_boresight_azimuths=(boresight_azimuth,),
+        sector_downtilt=0.0,
+        element_peak_gain_dbi=0.0,
+        element_front_to_back_db=0.0,
+    )
 
 
 def _validated_value(name: str, expected: typing.Any, value: object) -> object:
