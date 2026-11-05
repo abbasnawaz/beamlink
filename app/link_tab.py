@@ -14,6 +14,7 @@ from plots import (
     build_pdp_figure,
 )
 
+from beamlink.beamforming import sector_power_shares
 from beamlink.channel import subcarrier_frequencies_hz
 from beamlink.config import (
     APP_DEFAULT_POSITION_XY_M,
@@ -40,6 +41,15 @@ from beamlink.modulation import constellation
 from beamlink.predictor import BeamPredictor
 
 PATTERN_POINTS = 361
+SINGLE_PANEL_SHARE = 0.995
+SERVING_SECTOR_HELP = (
+    "The panel that carries the transmitted signal. A codebook beam uses one panel. MRT combines several "
+    "panels, so it shows the panel with the largest share of the transmit power and that share."
+)
+POWER_VS_SWEEP_HELP = (
+    "Power of the chosen weights minus the power of the best single codebook beam, in dB. Positive means "
+    "better than the best single codebook beam, which only MRT can achieve because it combines all panels."
+)
 MODULATION_LABELS = {Modulation.QPSK: "QPSK", Modulation.QAM16: "16-QAM", Modulation.QAM64: "64-QAM"}
 
 
@@ -70,6 +80,23 @@ class Controls:
 
 def sector_label(config: SystemConfig, sector_idx: int) -> str:
     return f"sector {sector_idx} ({np.rad2deg(config.sector_boresight_azimuths[sector_idx]):.0f} deg)"
+
+
+def _serving_share(config: SystemConfig, result: LinkResult) -> float:
+    shares = sector_power_shares(result.beam_weights, n_sectors=config.n_sectors)
+    return float(shares[result.serving_sector])
+
+
+def serving_text(config: SystemConfig, result: LinkResult) -> str:
+    label, share = sector_label(config, result.serving_sector), _serving_share(config, result)
+    return label if share >= SINGLE_PANEL_SHARE else f"{label}, {share:.0%} of power"
+
+
+def _serving_card_text(config: SystemConfig, result: LinkResult) -> str:
+    share = _serving_share(config, result)
+    if share >= SINGLE_PANEL_SHARE:
+        return sector_label(config, result.serving_sector)
+    return f"sector {result.serving_sector}, {share:.0%}"
 
 
 def selected_position(resources: AppResources) -> int:
@@ -172,6 +199,10 @@ def _map_section(
             st.rerun()
 
 
+def power_vs_sweep_db(result: LinkResult) -> float:
+    return float(-result.power_loss_db) + 0.0
+
+
 def _metric_cards(config: SystemConfig, result: LinkResult) -> None:
     columns = st.columns(7)
     columns[0].metric("Received SNR", f"{result.snr_db:.1f} dB")
@@ -179,8 +210,8 @@ def _metric_cards(config: SystemConfig, result: LinkResult) -> None:
     columns[2].metric("Bit error rate", f"{result.ber:.2e}")
     columns[3].metric("Spectral efficiency", f"{result.spectral_efficiency:.2f} bit/s/Hz")
     columns[4].metric("Beams tested", f"{result.beams_tested}")
-    columns[5].metric("Power loss vs sweep", f"{result.power_loss_db:+.2f} dB")
-    columns[6].metric("Serving sector", sector_label(config, result.serving_sector))
+    columns[5].metric("Power vs sweep", f"{power_vs_sweep_db(result):+.2f} dB", help=POWER_VS_SWEEP_HELP)
+    columns[6].metric("Serving sector", _serving_card_text(config, result), help=SERVING_SECTOR_HELP)
 
 
 def _pattern_figures(controls: Controls, result: LinkResult) -> None:
@@ -249,8 +280,8 @@ def _comparison_table(
                 "BER": f"{result.ber:.2e}",
                 "Spectral eff. (bit/s/Hz)": round(result.spectral_efficiency, 2),
                 "Beams tested": result.beams_tested,
-                "Serving sector": sector_label(controls.config, result.serving_sector),
-                "Loss vs sweep (dB)": round(result.power_loss_db, 2),
+                "Serving sector": serving_text(controls.config, result),
+                "Power vs sweep (dB)": round(power_vs_sweep_db(result), 2) + 0.0,
             }
         )
     st.subheader("All methods on the same channel and noise")
@@ -266,7 +297,7 @@ def render_link_tab(resources: AppResources, controls: Controls) -> None:
     location = dataset.positions_m[position_idx]
     st.markdown(
         f"**UE #{position_idx}** at ({location[0]:.1f}, {location[1]:.1f}) m, {region}, "
-        f"served by {sector_label(controls.config, result.serving_sector)}"
+        f"served by {serving_text(controls.config, result)}"
     )
     _map_section(resources, controls, result, paths, position_idx)
     _metric_cards(controls.config, result)

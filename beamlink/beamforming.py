@@ -79,10 +79,14 @@ def beam_sector(beam_idx: int, *, n_beams_per_sector: int) -> tuple[int, int]:
     return sector_idx, beam_in_sector
 
 
-def serving_sector(beam_weights: ComplexArray, *, n_sectors: int) -> int:
+def sector_power_shares(beam_weights: ComplexArray, *, n_sectors: int) -> FloatArray:
     per_sector = beam_weights.reshape(n_sectors, -1, *beam_weights.shape[1:])
     energy = np.sum(np.abs(per_sector) ** 2, axis=tuple(range(1, per_sector.ndim)))
-    return int(np.argmax(energy))
+    return (energy / np.sum(energy)).astype(np.float32)
+
+
+def serving_sector(beam_weights: ComplexArray, *, n_sectors: int) -> int:
+    return int(np.argmax(sector_power_shares(beam_weights, n_sectors=n_sectors)))
 
 
 def spread_over_subcarriers(beam_weights: ComplexArray, *, n_subcarriers: int) -> ComplexArray:

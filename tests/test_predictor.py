@@ -5,12 +5,13 @@ import pytest
 
 from beamlink.config import N_REFERENCE_SAMPLES, PREDICTOR_FILENAME
 from beamlink.exceptions import ShapeError
-from beamlink.metrics import top_k_accuracy, top_k_power_loss_db
+from beamlink.metrics import adjacent_beam_accuracy, sector_accuracy, top_k_accuracy, top_k_power_loss_db
 from beamlink.predictor import load_predictor, predict_logits, predict_top_k
 
 DATA_DIR = Path(__file__).resolve().parents[1] / "data"
 REFERENCE_RELATIVE_TOLERANCE = 1e-5
 TOP_K = 3
+BEAMS_PER_SECTOR = 16
 
 
 def _predictor_available() -> bool:
@@ -21,6 +22,31 @@ def test_top_k_accuracy_counts_hits_inside_the_candidate_set() -> None:
     candidates = np.array([[0, 1, 2], [3, 4, 5], [6, 7, 0]])
     best = np.array([2, 0, 6])
     assert top_k_accuracy(candidates, best) == pytest.approx(2 / 3)
+
+
+def test_sector_accuracy_compares_sectors_not_beams() -> None:
+    best = np.array([3, 3, 20, 47, 63])
+    predicted = np.array([3, 15, 16, 31, 47])
+    assert sector_accuracy(predicted, best, n_beams_per_sector=BEAMS_PER_SECTOR) == pytest.approx(3 / 5)
+
+
+def test_adjacent_beam_accuracy_accepts_only_neighbours_in_the_same_sector() -> None:
+    best = np.array([5, 5, 5, 5, 16, 15])
+    predicted = np.array([5, 4, 6, 7, 15, 16])
+    assert adjacent_beam_accuracy(predicted, best, n_beams_per_sector=BEAMS_PER_SECTOR) == pytest.approx(
+        3 / 6
+    )
+
+
+def test_beam_accuracies_are_ordered_exact_adjacent_sector() -> None:
+    rng = np.random.default_rng(0)
+    best = rng.integers(0, 4 * BEAMS_PER_SECTOR, 500)
+    predicted = np.clip(best + rng.integers(-3, 4, 500), 0, 4 * BEAMS_PER_SECTOR - 1)
+    exact = top_k_accuracy(predicted[:, np.newaxis], best)
+    adjacent = adjacent_beam_accuracy(predicted, best, n_beams_per_sector=BEAMS_PER_SECTOR)
+    sector = sector_accuracy(predicted, best, n_beams_per_sector=BEAMS_PER_SECTOR)
+    assert exact <= adjacent <= sector
+    assert exact < adjacent < sector
 
 
 def test_top_k_power_loss_is_zero_when_the_best_beam_is_a_candidate() -> None:

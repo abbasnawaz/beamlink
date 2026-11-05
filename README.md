@@ -11,15 +11,17 @@ A four-sector base station serves a single-antenna user in a 28 GHz street canyo
 
 Beam prediction at N = 8 elements per sector, so 64 beams (16 per sector), evaluated on spatially held-out test blocks (1,233 positions). "Beams measured" includes the 8 wide-beam probes that Model B needs as input.
 
-| Model | N | K | Beams measured | Overhead saved | Top-K accuracy | Mean power loss | 95th-pct power loss |
-|---|---|---|---|---|---|---|---|
-| A: position only | 8 | 1 | 1 / 64 | 98% | 54.7% | 1.79 dB | 8.78 dB |
-| A: position only | 8 | 3 | 3 / 64 | 95% | 83.3% | 0.59 dB | 4.68 dB |
-| **A: position only (deployed)** | 8 | 10 | 10 / 64 | 84% | **97.6%** | **0.02 dB** | **0.00 dB** |
-| A: position only | 16 | 10 | 10 / 128 | 92% | 91.1% | 0.32 dB | 1.67 dB |
-| B: position + 8 wide beams | 8 | 3 | 11 / 64 | 83% | 94.5% | 0.13 dB | 0.12 dB |
-| B: position + 8 wide beams | 16 | 3 | 11 / 128 | 91% | 90.3% | 0.37 dB | 1.61 dB |
-| Baseline: the 10 most common beams | 8 | 10 | 10 / 64 | 84% | 67.6% | 1.11 dB | 6.45 dB |
+| Model | N | K | Beams measured | Overhead saved | Mean power loss | 95th-pct power loss | Sector accuracy | Adjacent-beam accuracy | Top-K accuracy | Top-1 accuracy |
+|---|---|---|---|---|---|---|---|---|---|---|
+| A: position only | 8 | 1 | 1 / 64 | 98% | 1.79 dB | 8.78 dB | 90.4% | 78.9% | 54.7% | 54.7% |
+| A: position only | 8 | 3 | 3 / 64 | 95% | 0.59 dB | 4.68 dB | 90.4% | 78.9% | 83.3% | 54.7% |
+| **A: position only (deployed)** | 8 | 10 | 10 / 64 | 84% | **0.02 dB** | **0.00 dB** | 90.4% | 78.9% | **97.6%** | 54.7% |
+| A: position only | 16 | 10 | 10 / 128 | 92% | 0.32 dB | 1.67 dB | 89.1% | 70.6% | 91.1% | 50.4% |
+| B: position + 8 wide beams | 8 | 3 | 11 / 64 | 83% | 0.13 dB | 0.12 dB | 92.9% | 88.5% | 94.5% | 69.7% |
+| B: position + 8 wide beams | 16 | 3 | 11 / 128 | 91% | 0.37 dB | 1.61 dB | 93.7% | 83.6% | 90.3% | 55.3% |
+| Baseline: the 10 most common beams | 8 | 10 | 10 / 64 | 84% | 1.11 dB | 6.45 dB | 13.9% | 0.0% | 67.6% | 0.0% |
+
+Power loss comes first because it is the metric that matters on an oversampled codebook: a neighbouring beam is usually almost as good as the best one, so a top-1 miss often costs very little. Sector and adjacent-beam accuracy are measured on the top-1 beam: the share of test positions where it is in the best beam's sector, and where it is the best beam or its direct neighbour in that sector.
 
 Received SNR over the whole street grid at 30 dBm with N = 8 (medians). The v1 column is the original design: one ULA with isotropic elements.
 
@@ -98,6 +100,8 @@ python offline/05_evaluate.py                 # all figures in results/
 
 Every script is deterministic: running it twice produces byte-identical files.
 
+`data/beam_predictor.pt` is the PyTorch checkpoint of all four trained models (A and B, N = 8 and 16). `04_export_onnx.py` exports the deployed one from it, and `05_evaluate.py` reads it for the beam-prediction figure. The deployed app never loads it: it needs only `beam_predictor.onnx` and `norm.json`.
+
 Versions used: Python 3.12, Sionna RT 2.2.0 (Mitsuba 3.9.1, Dr.Jit 1.5.0), PyTorch 2.15.0, ONNX 1.23.2, ONNX Runtime 1.31.1, NumPy 2.5.4, Streamlit 1.66.1, Plotly 7.1.0.
 
 ## Deployment (Streamlit Community Cloud, free)
@@ -140,7 +144,7 @@ The gain can slightly exceed the nominal 17 dB because it is measured against on
 - **Spatial train/test split.** Neighbouring grid points 1.5 m apart see almost the same channel. A random split would put near-copies of every test point in the training set and inflate accuracy. Instead the grid is cut into 15 m × 15 m blocks, and whole blocks go to train, validation or test (4,681 / 864 / 1,233 positions). Test numbers are measured on streets the model never saw.
 - **48 paths per position, not 20.** In NLOS, many weak diffracted paths partly cancel each other. Keeping only the 20 strongest left more than 10% CFR error at 7% of NLOS positions, and one position came out 7–10 dB too strong. With 48 paths, the 95th-percentile NLOS error is 1.3%.
 - **Per-UE ray tracing.** Sionna's default path solver isn't reproducible. Its deterministic solver is, but its results depend on which receivers share a batch, so every UE position is traced on its own.
-- **Model A with K = 10 is deployed.** With 64 beams the best beam is harder to guess exactly (54.7% top-1), but neighbouring beams near a sector boundary are almost equally good. At K = 10 the AI matches v1's top-K accuracy (97.6%) while measuring 10 of 64 beams instead of 3 of 8. Only 0.2% of test users end up worse than with the v1 AI, and those are the users under the mast. Model B needs 8 wide-beam probes first (a 2-element sub-array per sector), so it costs 8 + K beams.
+- **Model A with K = 10 is deployed.** With 64 beams the best beam is harder to guess exactly (54.7% top-1), but the top-1 beam is in the right sector 90.4% of the time and within one beam of the best 78.9% of the time, and neighbouring beams are almost equally good. At K = 10 the AI matches v1's top-K accuracy (97.6%) while measuring 10 of 64 beams instead of 3 of 8. Only 0.2% of test users end up worse than with the v1 AI, and those are the users under the mast. Model B needs 8 wide-beam probes first (a 2-element sub-array per sector), so it costs 8 + K beams.
 - **Oversampled codebook (2N beams per sector).** The codebook is no longer orthonormal, so neighbouring beams overlap. In exchange there are no gaps between beams 45° off broadside, which is where the sector boundaries are.
 - **Beamforming gain is measured against one isotropic antenna.** It therefore includes the 8 dBi element gain as well as the array gain. Fixed-SNR mode scales the channel so that one isotropic antenna receives unit power.
 - **Polarization in the validation.** Sionna's tilted TR 38.901 panel radiates a field that is rotated by the TR 38.901 polarization angle ψ (eq. 7.1-15). Our scalar model, like the pattern formula itself, keeps the field vertical. With a 0° tilt the two agree to 0.21%. At 10° a tilted isotropic antenna alone already differs by up to 3.3%, and the directional pattern reduces that to 2.14% because it suppresses the side paths where ψ is largest. The tilted check uses a 3% tolerance, which is about 0.26 dB.

@@ -51,6 +51,20 @@ def top_k_accuracy(candidate_beams: npt.NDArray[np.int64], best_beam: npt.NDArra
     return float(np.mean(np.any(candidate_beams == best_beam[..., np.newaxis], axis=-1)))
 
 
+def sector_accuracy(
+    predicted_beam: npt.NDArray[np.int64], best_beam: npt.NDArray[np.int64], *, n_beams_per_sector: int
+) -> float:
+    return float(np.mean(predicted_beam // n_beams_per_sector == best_beam // n_beams_per_sector))
+
+
+def adjacent_beam_accuracy(
+    predicted_beam: npt.NDArray[np.int64], best_beam: npt.NDArray[np.int64], *, n_beams_per_sector: int
+) -> float:
+    same_sector = predicted_beam // n_beams_per_sector == best_beam // n_beams_per_sector
+    neighbour = np.abs(predicted_beam % n_beams_per_sector - best_beam % n_beams_per_sector) <= 1
+    return float(np.mean(same_sector & neighbour))
+
+
 def best_candidate_power_db(
     beam_power_db: npt.NDArray[np.float32], candidate_beams: npt.NDArray[np.int64]
 ) -> npt.NDArray[np.float32]:

@@ -11,6 +11,7 @@ from beamlink.config import (
     APP_BER_SLOTS,
     APP_BER_SNR_DB,
     MIN_SERVICE_SNR_DB,
+    SPLIT_TEST,
     BeamMethod,
     CsiMode,
     Modulation,
@@ -29,6 +30,15 @@ COVERAGE_VIEWS = (
 )
 SNR_VIEWS = COVERAGE_VIEWS[:2]
 NO_SERVICE_LABEL = f"No service (SNR < {MIN_SERVICE_SNR_DB:.0f} dB)"
+REPOSITORY_URL = "https://github.com/abbasnawaz/beamlink"
+SCOPE_AND_LIMITATIONS = (
+    "- Static channel: the user does not move during a slot, and there is no Doppler.\n"
+    "- A single user per simulation, so there is no multi-user interference.\n"
+    "- One ray-traced scene (Sionna RT's simple street canyon at 28 GHz), so the predictor is trained "
+    "for this street only.\n\n"
+    f"More in the README: [Why four sectors]({REPOSITORY_URL}#why-four-sectors) and "
+    f"[Limitations and future work]({REPOSITORY_URL}#limitations-and-future-work)."
+)
 PIPELINE_DOT = """
 digraph pipeline {
   rankdir=LR;
@@ -194,12 +204,20 @@ def render_about_tab(resources: AppResources) -> None:
     )
     if predictor is not None:
         top_k = resources.config.predictor_top_k
+        n_test_positions = int(np.count_nonzero(dataset.labels.split == SPLIT_TEST))
         st.subheader("Model card")
         st.markdown(
             f"MLP beam predictor, features `{predictor.norm.feature_set}` "
             f"({', '.join(predictor.norm.feature_names)}), N = {predictor.norm.n_antennas}, "
-            f"{predictor.norm.n_beams} beams. Evaluated on spatially held-out test blocks."
+            f"{predictor.norm.n_beams} beams. Evaluated on {n_test_positions} positions in spatially "
+            "held-out test blocks."
         )
         card = resources.model_card(top_k)
-        table = pd.DataFrame({"Metric": list(card), "Value": [round(value, 3) for value in card.values()]})
+        table = pd.DataFrame({"Metric": list(card), "Value": [f"{value:.2f}" for value in card.values()]})
         st.dataframe(table, hide_index=True)
+        st.caption(
+            "On an oversampled codebook, power loss is the metric that matters: a neighbouring beam is "
+            "usually almost as good as the best one, so a top-1 miss often costs very little."
+        )
+    st.subheader("Scope and limitations")
+    st.markdown(SCOPE_AND_LIMITATIONS)

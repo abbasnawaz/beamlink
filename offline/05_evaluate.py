@@ -8,7 +8,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import numpy.typing as npt
 from evaluate_beams import build_beam_pattern_figure, build_gain_figure
-from evaluate_link import build_ber_figure, build_diagnostics_figure
+from evaluate_link import build_ber_figure, build_dataset_links_figure, build_diagnostics_figure, link_results
 from evaluate_predictor import build_ai_coverage_figure, build_position_ber_figure, build_prediction_figure
 from evaluate_style import (
     CATEGORICAL,
@@ -36,9 +36,6 @@ from beamlink.config import (
     RT_TRACE_YAW,
     SCENE_IMAGE_FILENAME,
     BeamMethod,
-    CsiMode,
-    Modulation,
-    SimulationMode,
     SystemConfig,
     load_config,
     single_isotropic_panel,
@@ -50,19 +47,18 @@ from beamlink.data import (
     load_dataset,
     load_meta,
     nearest_position_idx,
-    position_paths,
 )
-from beamlink.link import LinkResult, array_response, run_link, system_codebook
+from beamlink.link import array_response, system_codebook
 from beamlink.linkbudget import linear_to_db, noise_variance_for_tx_power
 from beamlink.predictor import load_predictor
 
 logger = logging.getLogger("beamlink.offline")
 
 COVERAGE_CHUNK_POSITIONS = 500
-LINK_SLOTS = 4
-LINK_METHODS = (BeamMethod.SWEEP, BeamMethod.MRT_WIDEBAND, BeamMethod.MRT_SUBCARRIER)
 WORSE_THRESHOLD_DB = 1.0
 REFERENCE_POSITION_XY_M = (30.0, 0.0)
+EXPERIMENT_DROPPED_SECTOR = 3
+SNR_LOW_PERCENTILE = 5.0
 V1_CODEBOOK_OVERSAMPLING = 1
 
 
@@ -80,6 +76,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--data-dir", type=Path, default=Path("data"))
     parser.add_argument("--out-dir", type=Path, default=Path("results"))
+    parser.add_argument("--sector-experiment", type=Path, default=None)
     return parser.parse_args()
 
 
@@ -162,7 +159,7 @@ def log_sector_comparison(
     )
     position_idx = nearest_position_idx(dataset.positions_m, *REFERENCE_POSITION_XY_M)
     for name, system in (("single_ula", single_ula_config(config)), ("four_sectors", config)):
-        result = _link_results(dataset, system, position_idx, seed)[0]
+        result = link_results(dataset, system, position_idx, seed)[0]
         logger.info(
             f"sectors config={name} position={position_idx} sweep_gain_db={result.beamforming_gain_db:.2f} "
             f"nominal_gain_db={float(linear_to_db(system.n_antennas)) + system.element_peak_gain_dbi:.2f} "
@@ -254,94 +251,63 @@ def build_coverage_figure(
     save_figure(figure, out_path)
 
 
-def _link_results(dataset: Dataset, config: SystemConfig, position_idx: int, seed: int) -> list[LinkResult]:
-    paths = position_paths(dataset.paths, position_idx)
-    return [
-        run_link(
-            paths,
-            config,
-            method=method,
-            modulation=Modulation.QAM16,
-            csi_mode=CsiMode.LS,
-            simulation_mode=SimulationMode.FREQUENCY,
-            tx_power_dbm=config.tx_power_dbm,
-            seed=seed,
-            n_slots=LINK_SLOTS,
-        )
-        for method in LINK_METHODS
-    ]
-
-
-def _median_position(snr_db: npt.NDArray[np.float32], mask: npt.NDArray[np.bool_]) -> int:
-    candidates = np.flatnonzero(mask)
-    return int(candidates[np.argsort(snr_db[candidates])[candidates.size // 2]])
-
-
-def _log_link(region: str, position_idx: int, result: LinkResult) -> None:
+def _log_configuration(name: str, system: SystemConfig, coverage: SweepCoverage) -> None:
+    sectors = coverage.best_beam // system.n_beams_per_sector
+    shares = np.bincount(sectors, minlength=system.n_sectors) / sectors.size
     logger.info(
-        f"link region={region} position={position_idx} method={result.method} snr_db={result.snr_db:.1f} "
-        f"bf_gain_db={result.beamforming_gain_db:.2f} ber={result.ber:.2e} "
-        f"spectral_efficiency={result.spectral_efficiency:.2f} power_loss_db={result.power_loss_db:.2f} "
-        f"beam_idx={result.beam_idx} beams_tested={result.beams_tested}"
+        f"experiment config={name} sweep_beams={system.n_beams} "
+        f"sector_share_pct={[round(100 * float(share), 1) for share in shares]} "
+        f"no_service_pct={100 * np.mean(coverage.sweep_snr_db < MIN_SERVICE_SNR_DB):.2f} "
+        f"median_snr_db={np.median(coverage.sweep_snr_db):.2f} "
+        f"p{SNR_LOW_PERCENTILE:.0f}_snr_db={np.percentile(coverage.sweep_snr_db, SNR_LOW_PERCENTILE):.2f}"
     )
 
 
-def _link_row(
-    panels: npt.NDArray[np.object_],
+def sector_experiment(
     dataset: Dataset,
+    meta: SceneMeta,
     config: SystemConfig,
-    region: str,
-    position_idx: int,
-    seed: int,
+    coverages: tuple[SweepCoverage, SweepCoverage],
+    data_dir: Path,
+    out_path: Path,
 ) -> None:
-    results = _link_results(dataset, config, position_idx, seed)
-    location = dataset.positions_m[position_idx]
-    visible = results[0].pdp > 0
-    delay_ns, pdp_db = results[0].pdp_delay_s[visible] * 1e9, linear_to_db(results[0].pdp[visible])
-    panels[0].vlines(delay_ns, pdp_db.min() - 5, pdp_db, color=CATEGORICAL[0], lw=1.5)
-    panels[0].plot(delay_ns, pdp_db, "o", color=CATEGORICAL[0], ms=5)
-    panels[0].set_xlabel("Delay after first arrival (ns)")
-    panels[0].set_ylabel("Path gain (dB)")
-    panels[0].set_title(f"{region} position #{position_idx} at ({location[0]:.1f}, {location[1]:.1f}) m: PDP")
-    frequency_megahertz = (
-        (np.arange(config.n_subcarriers) - config.n_subcarriers // 2) * config.subcarrier_spacing_hz / 1e6
+    coverage, single_ula = coverages
+    kept = tuple(
+        azimuth
+        for sector_idx, azimuth in enumerate(config.sector_boresight_azimuths)
+        if sector_idx != EXPERIMENT_DROPPED_SECTOR
     )
-    panels[1].plot(
-        frequency_megahertz,
-        linear_to_db(np.abs(results[0].cfr_reference_antenna) ** 2),
-        color=NEUTRAL,
-        lw=1.5,
-        label="One isotropic antenna",
+    reduced = replace(config, sector_boresight_azimuths=kept)
+    reduced_coverage = sweep_coverage(dataset, reduced)
+    _log_configuration("four_sectors", config, coverage)
+    _log_configuration("three_sectors", reduced, reduced_coverage)
+    served = coverage.best_beam // config.n_beams_per_sector == EXPERIMENT_DROPPED_SECTOR
+    loss_db = coverage.sweep_snr_db - reduced_coverage.sweep_snr_db
+    versus_ula_db = reduced_coverage.sweep_snr_db - single_ula.sweep_snr_db
+    newly_unserved = (reduced_coverage.sweep_snr_db < MIN_SERVICE_SNR_DB) & (
+        coverage.sweep_snr_db >= MIN_SERVICE_SNR_DB
     )
-    for result in results:
-        panels[1].plot(
-            frequency_megahertz,
-            linear_to_db(np.abs(result.h_eff_true) ** 2),
-            color=METHOD_COLORS[result.method],
-            lw=2,
-            label=METHOD_LABELS[result.method],
-        )
-        _log_link(region, position_idx, result)
-    panels[1].set_xlabel("Baseband frequency (MHz)")
-    panels[1].set_ylabel("|channel| (dB, includes path loss)")
-    panels[1].set_title(
-        f"{region}: isotropic antenna vs beamformed h_eff (N = {config.n_antennas} per sector)"
+    lost_service = served & newly_unserved
+    logger.info(
+        f"experiment dropped_sector={EXPERIMENT_DROPPED_SECTOR} served_positions={int(served.sum())} "
+        f"loss_mean_db={loss_db[served].mean():.2f} loss_p95_db={np.percentile(loss_db[served], 95):.2f} "
+        f"loss_max_db={loss_db[served].max():.2f} served_los={int((served & dataset.is_los).sum())} "
+        f"served_snr_median_db={np.median(coverage.sweep_snr_db[served]):.1f} "
+        f"lost_service={int(lost_service.sum())} "
+        f"newly_unserved_total={int(np.sum(newly_unserved))} "
+        f"three_sectors_worse_than_v1_pct={100 * np.mean(versus_ula_db < -WORSE_THRESHOLD_DB):.2f}"
     )
-    panels[1].legend(frameon=False, fontsize=8)
-    for panel in panels:
-        style_axes(panel)
-
-
-def build_dataset_links_figure(
-    dataset: Dataset, config: SystemConfig, coverage: SweepCoverage, seed: int, out_path: Path
-) -> None:
-    picks = {
-        "LOS": _median_position(coverage.sweep_snr_db, dataset.is_los),
-        "NLOS": _median_position(coverage.sweep_snr_db, ~dataset.is_los),
-    }
-    figure, panels = plt.subplots(2, 2, figsize=(14, 9))
-    for row, (region, position_idx) in enumerate(picks.items()):
-        _link_row(panels[row], dataset, config, region, position_idx, seed)
+    image = plt.imread(data_dir / SCENE_IMAGE_FILENAME)
+    figure, panel = plt.subplots(figsize=(9, 6))
+    map_panel(
+        panel, meta, image, f"SNR lost without sector {EXPERIMENT_DROPPED_SECTOR} by the users it serves (dB)"
+    )
+    map_scatter(panel, dataset, np.full(served.size, "#e4e3df"))
+    points = dataset.positions_m[served]
+    scatter = panel.scatter(
+        points[:, 0], points[:, 1], c=loss_db[served], s=12, marker="s", lw=0, cmap="Oranges", vmin=0.0
+    )
+    figure.colorbar(scatter, ax=panel, shrink=0.8)
     figure.tight_layout()
     save_figure(figure, out_path)
 
@@ -351,6 +317,11 @@ def main() -> None:
     matplotlib.use("Agg")
     config = load_config(args.config)
     rng = np.random.default_rng(args.seed)
+    if args.sector_experiment is not None:
+        dataset, meta = load_dataset(args.data_dir), load_meta(args.data_dir)
+        coverages = (sweep_coverage(dataset, config), sweep_coverage(dataset, single_ula_config(config)))
+        sector_experiment(dataset, meta, config, coverages, args.data_dir, args.sector_experiment)
+        return
     args.out_dir.mkdir(parents=True, exist_ok=True)
     build_ber_figure(config, rng, args.seed, args.out_dir / "ber_synthetic.png")
     build_diagnostics_figure(config, rng, args.seed, args.out_dir / "ofdm_diagnostics.png")
@@ -371,7 +342,9 @@ def main() -> None:
     build_coverage_figure(
         dataset, meta, config, (coverage, single_ula), args.data_dir, args.out_dir / "coverage_sweep.png"
     )
-    build_dataset_links_figure(dataset, config, coverage, args.seed, args.out_dir / "dataset_links.png")
+    build_dataset_links_figure(
+        dataset, config, coverage.sweep_snr_db, args.seed, args.out_dir / "dataset_links.png"
+    )
     predictor = load_predictor(args.data_dir)
     build_prediction_figure(
         dataset, config, args.data_dir / CHECKPOINT_FILENAME, args.out_dir / "beam_prediction.png"

@@ -32,7 +32,13 @@ from beamlink.config import (
 from beamlink.data import Dataset, SceneMeta, load_dataset, load_meta, load_scene_image, predictor_features
 from beamlink.exceptions import ArtifactError, BeamLinkError
 from beamlink.linkbudget import received_snr_db
-from beamlink.metrics import best_candidate_power_db, top_k_accuracy, top_k_power_loss_db
+from beamlink.metrics import (
+    adjacent_beam_accuracy,
+    best_candidate_power_db,
+    sector_accuracy,
+    top_k_accuracy,
+    top_k_power_loss_db,
+)
 from beamlink.predictor import BeamPredictor, load_predictor, predict_top_k
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -111,14 +117,19 @@ def get_model_card(top_k: int) -> dict[str, float]:
     predictor, dataset, ranking = get_predictor(), get_dataset(), get_ai_ranking(top_k)
     test = dataset.labels.split == SPLIT_TEST
     n_antennas = predictor.norm.n_antennas
+    beams_per_sector = predictor.norm.n_beams // get_config().n_sectors
     best = dataset.labels.best_beam[n_antennas][test].astype(np.int64)
+    top_1 = ranking[test, 0]
     loss_db = top_k_power_loss_db(dataset.labels.beam_power_db[n_antennas][test], ranking[test])
     return {
-        "top-1 accuracy": top_k_accuracy(ranking[test, :1], best),
-        f"top-{top_k} accuracy": top_k_accuracy(ranking[test], best),
-        f"mean power loss, K={top_k} (dB)": float(loss_db.mean()),
-        f"95th-percentile power loss, K={top_k} (dB)": float(np.percentile(loss_db, 95)),
-        "test positions": float(test.sum()),
+        f"Mean power loss vs sweep, K = {top_k} (dB)": float(loss_db.mean()),
+        f"95th-percentile power loss, K = {top_k} (dB)": float(np.percentile(loss_db, 95)),
+        "Sector accuracy, top-1 beam (%)": 100
+        * sector_accuracy(top_1, best, n_beams_per_sector=beams_per_sector),
+        "Adjacent-beam accuracy, top-1 beam (%)": 100
+        * adjacent_beam_accuracy(top_1, best, n_beams_per_sector=beams_per_sector),
+        f"Top-{top_k} accuracy (%)": 100 * top_k_accuracy(ranking[test], best),
+        "Top-1 accuracy (%)": 100 * top_k_accuracy(ranking[test, :1], best),
     }
 
 

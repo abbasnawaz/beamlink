@@ -1,5 +1,6 @@
 import numpy as np
 import numpy.typing as npt
+import pytest
 
 from beamlink.array import beam_pattern, ula_steering_vectors
 from beamlink.beamforming import (
@@ -8,6 +9,7 @@ from beamlink.beamforming import (
     codebook_beam_azimuths,
     dft_codebook,
     effective_channel,
+    sector_power_shares,
     sectored_codebook,
     serving_sector,
     spread_over_subcarriers,
@@ -222,3 +224,24 @@ def test_serving_sector_of_per_subcarrier_weights_follows_the_energy() -> None:
     weights[8:12] = 0.5
     weights[0:4, :10] = 0.1
     assert serving_sector(weights, n_sectors=3) == 2
+
+
+def test_sector_power_shares_sum_to_one_and_are_whole_for_codebook_beams() -> None:
+    n_antennas, n_sectors = 8, 4
+    codebook = sectored_codebook(
+        n_antennas=n_antennas,
+        n_sectors=n_sectors,
+        oversampling=2,
+        spacing_wavelengths=HALF_WAVELENGTH,
+        sector=None,
+    )
+    for beam_idx in (0, 21, 40, 63):
+        shares = sector_power_shares(codebook[beam_idx], n_sectors=n_sectors)
+        assert shares[beam_idx // (2 * n_antennas)] == pytest.approx(1.0)
+    weights = np.zeros((n_sectors * n_antennas, N_SUBCARRIERS), dtype=np.complex64)
+    weights[:n_antennas] = 0.5
+    weights[2 * n_antennas : 3 * n_antennas] = 1.0
+    shares = sector_power_shares(weights, n_sectors=n_sectors)
+    assert shares.sum() == pytest.approx(1.0)
+    assert shares[2] == pytest.approx(0.8)
+    assert shares[0] == pytest.approx(0.2)

@@ -1,9 +1,19 @@
+import logging
 from dataclasses import replace
 from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
-from evaluate_style import CATEGORICAL, NEUTRAL, positive, save_figure, style_axes
+import numpy.typing as npt
+from evaluate_style import (
+    CATEGORICAL,
+    METHOD_COLORS,
+    METHOD_LABELS,
+    NEUTRAL,
+    positive,
+    save_figure,
+    style_axes,
+)
 from matplotlib.axes import Axes
 
 from beamlink.config import (
@@ -19,12 +29,16 @@ from beamlink.config import (
     SystemConfig,
     single_isotropic_panel,
 )
-from beamlink.data import ChannelPaths, position_paths, synthetic_paths
+from beamlink.data import ChannelPaths, Dataset, position_paths, synthetic_paths
 from beamlink.link import LinkResult, run_link
 from beamlink.linkbudget import db_to_linear, linear_to_db, noise_variance_for_snr
 from beamlink.metrics import awgn_ber_theory, fading_ber_theory
 from beamlink.modulation import constellation
 
+logger = logging.getLogger("beamlink.offline")
+
+LINK_SLOTS = 4
+LINK_METHODS = (BeamMethod.SWEEP, BeamMethod.MRT_WIDEBAND, BeamMethod.MRT_SUBCARRIER)
 MODULATION_LABELS = {Modulation.QPSK: "QPSK", Modulation.QAM16: "16-QAM", Modulation.QAM64: "64-QAM"}
 BER_SNR_DB = np.arange(0.0, 32.0, 2.0)
 BER_SLOTS = 8
@@ -278,5 +292,101 @@ def build_diagnostics_figure(
     _cp_panel(panels[1, 1], config, rng, seed)
     for panel in panels.flat[:3]:
         style_axes(panel)
+    figure.tight_layout()
+    save_figure(figure, out_path)
+
+
+def link_results(dataset: Dataset, config: SystemConfig, position_idx: int, seed: int) -> list[LinkResult]:
+    paths = position_paths(dataset.paths, position_idx)
+    return [
+        run_link(
+            paths,
+            config,
+            method=method,
+            modulation=Modulation.QAM16,
+            csi_mode=CsiMode.LS,
+            simulation_mode=SimulationMode.FREQUENCY,
+            tx_power_dbm=config.tx_power_dbm,
+            seed=seed,
+            n_slots=LINK_SLOTS,
+        )
+        for method in LINK_METHODS
+    ]
+
+
+def _median_position(snr_db: npt.NDArray[np.float32], mask: npt.NDArray[np.bool_]) -> int:
+    candidates = np.flatnonzero(mask)
+    return int(candidates[np.argsort(snr_db[candidates])[candidates.size // 2]])
+
+
+def _log_link(region: str, position_idx: int, result: LinkResult) -> None:
+    logger.info(
+        f"link region={region} position={position_idx} method={result.method} snr_db={result.snr_db:.1f} "
+        f"bf_gain_db={result.beamforming_gain_db:.2f} ber={result.ber:.2e} "
+        f"spectral_efficiency={result.spectral_efficiency:.2f} power_loss_db={result.power_loss_db:.2f} "
+        f"beam_idx={result.beam_idx} beams_tested={result.beams_tested}"
+    )
+
+
+def _link_row(
+    panels: npt.NDArray[np.object_],
+    dataset: Dataset,
+    config: SystemConfig,
+    region: str,
+    position_idx: int,
+    seed: int,
+) -> None:
+    results = link_results(dataset, config, position_idx, seed)
+    location = dataset.positions_m[position_idx]
+    visible = results[0].pdp > 0
+    delay_ns, pdp_db = results[0].pdp_delay_s[visible] * 1e9, linear_to_db(results[0].pdp[visible])
+    panels[0].vlines(delay_ns, pdp_db.min() - 5, pdp_db, color=CATEGORICAL[0], lw=1.5)
+    panels[0].plot(delay_ns, pdp_db, "o", color=CATEGORICAL[0], ms=5)
+    panels[0].set_xlabel("Delay after first arrival (ns)")
+    panels[0].set_ylabel("Path gain (dB)")
+    panels[0].set_title(f"{region} position #{position_idx} at ({location[0]:.1f}, {location[1]:.1f}) m: PDP")
+    frequency_megahertz = (
+        (np.arange(config.n_subcarriers) - config.n_subcarriers // 2) * config.subcarrier_spacing_hz / 1e6
+    )
+    panels[1].plot(
+        frequency_megahertz,
+        linear_to_db(np.abs(results[0].cfr_reference_antenna) ** 2),
+        color=NEUTRAL,
+        lw=1.5,
+        label="One isotropic antenna",
+    )
+    for result in results:
+        panels[1].plot(
+            frequency_megahertz,
+            linear_to_db(np.abs(result.h_eff_true) ** 2),
+            color=METHOD_COLORS[result.method],
+            lw=2,
+            label=METHOD_LABELS[result.method],
+        )
+        _log_link(region, position_idx, result)
+    panels[1].set_xlabel("Baseband frequency (MHz)")
+    panels[1].set_ylabel("|channel| (dB, includes path loss)")
+    panels[1].set_title(
+        f"{region}: isotropic antenna vs beamformed h_eff (N = {config.n_antennas} per sector)"
+    )
+    panels[1].legend(frameon=False, fontsize=8)
+    for panel in panels:
+        style_axes(panel)
+
+
+def build_dataset_links_figure(
+    dataset: Dataset,
+    config: SystemConfig,
+    sweep_snr_db: npt.NDArray[np.float32],
+    seed: int,
+    out_path: Path,
+) -> None:
+    picks = {
+        "LOS": _median_position(sweep_snr_db, dataset.is_los),
+        "NLOS": _median_position(sweep_snr_db, ~dataset.is_los),
+    }
+    figure, panels = plt.subplots(2, 2, figsize=(14, 9))
+    for row, (region, position_idx) in enumerate(picks.items()):
+        _link_row(panels[row], dataset, config, region, position_idx, seed)
     figure.tight_layout()
     save_figure(figure, out_path)

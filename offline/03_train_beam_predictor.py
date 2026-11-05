@@ -21,7 +21,7 @@ from beamlink.config import (
     load_config,
 )
 from beamlink.data import Dataset, Labels, feature_names, load_dataset, n_probe_beams, predictor_features
-from beamlink.metrics import top_k_accuracy, top_k_power_loss_db
+from beamlink.metrics import adjacent_beam_accuracy, sector_accuracy, top_k_accuracy, top_k_power_loss_db
 from beamlink.predictor import PredictorNorm, norm_document
 
 logger = logging.getLogger("beamlink.offline")
@@ -146,12 +146,21 @@ def log_test_metrics(
     labels: Labels,
     feature_set: FeatureSet,
     n_antennas: int,
-    n_wide_beams: int,
+    config: SystemConfig,
 ) -> None:
     test = labels.split == SPLIT_TEST
     beam_power_db = labels.beam_power_db[n_antennas][test]
     best = labels.best_beam[n_antennas][test].astype(np.int64)
-    for n_candidates in REPORTED_TOP_K:
+    n_wide_beams = config.n_wide_beams
+    beams_per_sector = beam_power_db.shape[1] // config.n_sectors
+    top_1 = predicted_top_k(model, features[test], 1)[:, 0]
+    sector = sector_accuracy(top_1, best, n_beams_per_sector=beams_per_sector)
+    adjacent = adjacent_beam_accuracy(top_1, best, n_beams_per_sector=beams_per_sector)
+    logger.info(
+        f"test model={model_key(feature_set, n_antennas)} "
+        f"sector_accuracy={sector:.3f} adjacent_beam_accuracy={adjacent:.3f}"
+    )
+    for n_candidates in sorted({*REPORTED_TOP_K, config.predictor_top_k}):
         candidates = predicted_top_k(model, features[test], n_candidates)
         loss_db = top_k_power_loss_db(beam_power_db, candidates)
         accuracy = top_k_accuracy(candidates, best)
@@ -173,7 +182,7 @@ def train_all(dataset: Dataset, config: SystemConfig, seed: int) -> list[Trained
         for n_antennas in config.label_antenna_counts:
             key = model_key(feature_set, n_antennas)
             model, best_epoch = train_classifier(normalized, dataset.labels, n_antennas, config, seed)
-            log_test_metrics(model, normalized, dataset.labels, feature_set, n_antennas, config.n_wide_beams)
+            log_test_metrics(model, normalized, dataset.labels, feature_set, n_antennas, config)
             n_beams = dataset.labels.beam_power_db[n_antennas].shape[1]
             trained.append(
                 TrainedModel(key, feature_set, n_antennas, n_beams, mean, std, model.state_dict(), best_epoch)
